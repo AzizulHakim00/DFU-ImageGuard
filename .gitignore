@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+.env
+*.token
+*.key
+kaggle.json
+runs/
+cache/
+*.pt
+*.pth
+*.safetensors
+*.pkl
+!results/runs/**/dfu_imageguard_complete_reproducibility.pkl
