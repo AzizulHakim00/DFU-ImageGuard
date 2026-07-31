@@ -27,6 +27,7 @@ from .config_data import (
     assign_duplicate_groups,
     build_manifest,
     download_dataset,
+    google_drive_is_mounted,
     make_outer_folds,
     mount_drive,
     now_run_id,
@@ -58,11 +59,7 @@ def resolve_resumable_run_id(cfg: Config) -> None:
     if cfg.RUN_ID is None:
         candidate = active_marker.read_text(encoding="utf-8").strip() if active_marker.exists() else ""
         candidate_root = runs_root / candidate if candidate else None
-        if (
-            candidate_root
-            and candidate_root.exists()
-            and not (candidate_root / "final_verification.json").exists()
-        ):
+        if candidate_root and candidate_root.exists() and not (candidate_root / "final_verification.json").exists():
             cfg.RUN_ID = candidate
             print(f"Resuming interrupted run: {cfg.RUN_ID}")
         else:
@@ -81,6 +78,20 @@ def _baseline_factory(timm_name: str):
     return lambda pretrained=True: build_baseline_model(timm_name, pretrained=pretrained)
 
 
+def _resolve_storage(cfg: Config) -> None:
+    mount_drive(cfg)
+    # A failed older run may have created a normal local directory named
+    # /content/drive/MyDrive. A directory alone is not proof that Drive is mounted.
+    if cfg.STORAGE_MODE == "google_drive" and not google_drive_is_mounted():
+        if not cfg.ALLOW_LOCAL_FALLBACK:
+            raise RuntimeError("Google Drive is not an actual mounted filesystem")
+        cfg.DRIVE_ROOT = cfg.LOCAL_FALLBACK_ROOT
+        cfg.STORAGE_MODE = "local_fallback"
+        Path(cfg.DRIVE_ROOT).mkdir(parents=True, exist_ok=True)
+        print("WARNING: stale /content/drive directory detected; using verified local fallback storage.")
+        print(f"Local fallback: {cfg.DRIVE_ROOT}")
+
+
 def run_complete_pipeline(overrides: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     cfg = Config()
     for key, value in (overrides or {}).items():
@@ -88,7 +99,7 @@ def run_complete_pipeline(overrides: Optional[dict[str, Any]] = None) -> dict[st
             raise KeyError(f"Unknown configuration key: {key}")
         setattr(cfg, key, value)
 
-    mount_drive(cfg)
+    _resolve_storage(cfg)
     resolve_resumable_run_id(cfg)
     seed_everything(cfg.SEED)
     dirs = prepare_run_dirs(cfg)
@@ -166,16 +177,8 @@ def run_complete_pipeline(overrides: Optional[dict[str, Any]] = None) -> dict[st
         error_frame = error_analysis(predictions, cfg, dirs)
         make_core_figures(manifest, predictions, metrics, dirs)
         make_error_gallery(error_frame, dirs)
-        robustness = (
-            run_robustness(manifest, predictions, cfg, dirs)
-            if cfg.RUN_ROBUSTNESS
-            else pd.DataFrame()
-        )
-        xai = (
-            run_xai(manifest, predictions, cfg, dirs)
-            if cfg.RUN_XAI
-            else pd.DataFrame()
-        )
+        robustness = run_robustness(manifest, predictions, cfg, dirs) if cfg.RUN_ROBUSTNESS else pd.DataFrame()
+        xai = run_xai(manifest, predictions, cfg, dirs) if cfg.RUN_XAI else pd.DataFrame()
 
         versions = software_hardware_versions()
         write_json(dirs["root"] / "software_versions.json", versions)
@@ -229,10 +232,7 @@ def run_complete_pipeline(overrides: Optional[dict[str, Any]] = None) -> dict[st
         write_json(dirs["root"] / "final_verification.json", verification)
 
         project_root = Path(cfg.DRIVE_ROOT)
-        (project_root / "LAST_COMPLETED_RUN.txt").write_text(
-            str(cfg.RUN_ID) + "\n",
-            encoding="utf-8",
-        )
+        (project_root / "LAST_COMPLETED_RUN.txt").write_text(str(cfg.RUN_ID) + "\n", encoding="utf-8")
         active_marker = project_root / "ACTIVE_RUN.txt"
         if active_marker.exists():
             active_marker.unlink()
@@ -252,31 +252,23 @@ def run_complete_pipeline(overrides: Optional[dict[str, Any]] = None) -> dict[st
         raise
 
 
-def find_latest_drive_run(
-    drive_root: str = "/content/drive/MyDrive/DFU-ImageGuard",
-) -> Path:
+def find_latest_drive_run(drive_root: str = "/content/drive/MyDrive/DFU-ImageGuard") -> Path:
     runs = Path(drive_root) / "runs"
     if not runs.exists():
         raise FileNotFoundError(f"Run directory does not exist: {runs}")
-    valid = [
-        path
-        for path in runs.glob("*")
-        if (path / "dfu_imageguard_complete_reproducibility.pkl").exists()
-    ]
+    valid = [path for path in runs.glob("*") if (path / "dfu_imageguard_complete_reproducibility.pkl").exists()]
     if not valid:
         raise FileNotFoundError(f"No completed run found under {runs}")
     return max(valid, key=lambda path: path.stat().st_mtime)
 
 
-def load_latest_artifacts(
-    drive_root: Optional[str] = None,
-) -> dict[str, Any]:
+def load_latest_artifacts(drive_root: Optional[str] = None) -> dict[str, Any]:
     cfg = Config()
     if drive_root is not None:
         cfg.DRIVE_ROOT = drive_root
         cfg.MOUNT_DRIVE = False
         cfg.LOCAL_FALLBACK_ROOT = drive_root
-    mount_drive(cfg)
+    _resolve_storage(cfg)
     run = find_latest_drive_run(cfg.DRIVE_ROOT)
     pkl_path = run / "dfu_imageguard_complete_reproducibility.pkl"
     print(f"Loading trusted local artifact: {pkl_path}")
@@ -300,12 +292,8 @@ def upload_existing_run(
         if not hasattr(cfg, key):
             raise KeyError(f"Unknown configuration key: {key}")
         setattr(cfg, key, value)
-    mount_drive(cfg)
-    run = (
-        Path(cfg.DRIVE_ROOT) / "runs" / run_id
-        if run_id
-        else find_latest_drive_run(cfg.DRIVE_ROOT)
-    )
+    _resolve_storage(cfg)
+    run = Path(cfg.DRIVE_ROOT) / "runs" / run_id if run_id else find_latest_drive_run(cfg.DRIVE_ROOT)
     if not run.exists():
         raise FileNotFoundError(run)
     cfg.RUN_ID = run.name
