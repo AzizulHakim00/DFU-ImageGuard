@@ -21,3 +21,4 @@ for rel in ['bootstrap_payload.py','.github/workflows/bootstrap.yml']:
     path=ROOT/rel
     if path.exists(): path.unlink()
 print('Extracted and validated the complete DFU-ImageGuard repository payload.')
+# Triggered after all checksum-verified payload chunks were uploaded.
