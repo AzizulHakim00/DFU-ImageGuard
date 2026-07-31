@@ -15,6 +15,26 @@ from .statistics_figures import *
 from .robustness_xai import *
 from .artifacts import *
 
+
+def resolve_resumable_run_id(cfg: Config) -> None:
+    project_root = Path(cfg.DRIVE_ROOT)
+    runs_root = project_root / "runs"
+    runs_root.mkdir(parents=True, exist_ok=True)
+    active_marker = project_root / "ACTIVE_RUN.txt"
+    if cfg.RUN_ID is None:
+        candidate = active_marker.read_text(encoding="utf-8").strip() if active_marker.exists() else ""
+        candidate_root = runs_root / candidate if candidate else None
+        if candidate_root and candidate_root.exists() and not (candidate_root / "final_verification.json").exists():
+            cfg.RUN_ID = candidate
+            print(f"Resuming interrupted Drive run: {cfg.RUN_ID}")
+        else:
+            cfg.RUN_ID = now_run_id()
+            active_marker.write_text(str(cfg.RUN_ID) + "\n", encoding="utf-8")
+            print(f"Starting new Drive run: {cfg.RUN_ID}")
+    else:
+        active_marker.write_text(str(cfg.RUN_ID) + "\n", encoding="utf-8")
+
+
 def run_complete_pipeline(overrides: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     cfg = Config()
     for key, value in (overrides or {}).items():
@@ -22,6 +42,7 @@ def run_complete_pipeline(overrides: Optional[dict[str, Any]] = None) -> dict[st
             raise KeyError(f"Unknown configuration key: {key}")
         setattr(cfg, key, value)
     mount_drive()
+    resolve_resumable_run_id(cfg)
     seed_everything(cfg.SEED)
     dirs = prepare_run_dirs(cfg)
     started = time.time()
