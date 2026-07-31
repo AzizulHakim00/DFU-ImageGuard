@@ -1,0 +1,20 @@
+project_name: DFU-ImageGuard
+repository: AzizulHakim00/DFU-ImageGuard
+dataset_handle: laithjj/diabetic-foot-ulcer-dfu
+included_subset: Patches only
+label_policy: explicit immediate Normal and Abnormal/Ulcer folders only
+seed: 2026
+outer_folds: 5
+image_size: 224
+batch_size: 24
+max_epochs: 30
+early_stopping_patience: 7
+primary_backbone: convnext_tiny
+primary_model_fits: 5
+force_retrain: false
+run_baselines: true
+run_robustness: true
+run_xai: true
+bootstrap_repetitions: 1000
+split_unit_when_patient_id_absent: exact_and_near_duplicate_group
+target_sensitivity_for_threshold: 0.95
