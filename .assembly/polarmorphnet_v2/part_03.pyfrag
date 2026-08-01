@@ -1,0 +1,134 @@
+
+
+class DFUDataset:
+    def __init__(self, frame: pd.DataFrame, transform: Any):
+        self.frame = frame.reset_index(drop=True)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.frame)
+
+    def __getitem__(self, index: int):
+        import torch
+
+        row = self.frame.iloc[index]
+        with Image.open(row.image_path) as image:
+            tensor = self.transform(image.convert("RGB"))
+        return {
+            "image": tensor, "label": torch.tensor(float(row.label)),
+            "cluster_weight": torch.tensor(float(row.cluster_weight)),
+            "index": torch.tensor(index),
+        }
+
+
+def build_transforms(cfg: Config):
+    from torchvision import transforms
+
+    train = transforms.Compose([
+        transforms.Resize((cfg.IMAGE_SIZE + 24, cfg.IMAGE_SIZE + 24)),
+        transforms.RandomResizedCrop(cfg.IMAGE_SIZE, scale=(0.78, 1.0), ratio=(0.88, 1.12)),
+        transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip(p=0.15),
+        transforms.RandomRotation(12),
+        transforms.ColorJitter(brightness=0.20, contrast=0.20, saturation=0.15, hue=0.03),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    evaluate = transforms.Compose([
+        transforms.Resize((cfg.IMAGE_SIZE, cfg.IMAGE_SIZE)), transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    return train, evaluate
+
+
+def build_loader(frame: pd.DataFrame, transform: Any, cfg: Config, training: bool, seed: int):
+    import torch
+    from torch.utils.data import DataLoader, WeightedRandomSampler
+
+    dataset = DFUDataset(frame, transform)
+    generator = torch.Generator().manual_seed(seed)
+    sampler = None
+    shuffle = training
+    if training and cfg.CLUSTER_BALANCED_SAMPLER:
+        weights = 1.0 / frame.group_size.to_numpy(dtype=float)
+        sampler = WeightedRandomSampler(torch.as_tensor(weights, dtype=torch.double), len(frame), True, generator=generator)
+        shuffle = False
+    return DataLoader(
+        dataset, batch_size=cfg.BATCH_SIZE, shuffle=shuffle, sampler=sampler,
+        num_workers=cfg.NUM_WORKERS, pin_memory=torch.cuda.is_available(),
+        persistent_workers=cfg.NUM_WORKERS > 0, worker_init_fn=seed_worker, generator=generator,
+    )
+
+
+def drop_path(x, probability: float, training: bool):
+    if probability <= 0 or not training:
+        return x
+    import torch
+
+    keep = 1.0 - probability
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    mask = torch.floor(keep + torch.rand(shape, device=x.device, dtype=x.dtype))
+    return x * mask / keep
+
+
+def build_model_class():
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class DropPath(nn.Module):
+        def __init__(self, probability: float):
+            super().__init__(); self.probability = probability
+        def forward(self, x):
+            return drop_path(x, self.probability, self.training)
+
+    class MorphologyBlock(nn.Module):
+        def __init__(self, channels: int, probability: float):
+            super().__init__()
+            self.norm = nn.GroupNorm(1, channels)
+            self.local = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
+            self.context = nn.Conv2d(channels, channels, 5, padding=4, dilation=2, groups=channels)
+            self.mix = nn.Sequential(nn.Conv2d(channels * 2, channels * 4, 1), nn.GELU(), nn.Conv2d(channels * 4, channels, 1))
+            self.gate = nn.Sequential(nn.Conv2d(channels, channels, 1), nn.Sigmoid())
+            self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1) * 1e-3)
+            self.path = DropPath(probability)
+        def forward(self, x):
+            z = self.norm(x)
+            response = self.mix(torch.cat([self.local(z), self.context(z)], dim=1)) * self.gate(z)
+            return x + self.path(self.gamma * response)
+
+    class WeakLesionDiscovery(nn.Module):
+        def __init__(self, channels: int):
+            super().__init__()
+            self.head = nn.Sequential(nn.Conv2d(channels * 3, channels // 2, 1), nn.GELU(), nn.Conv2d(channels // 2, 1, 1))
+        def forward(self, feature):
+            gx = F.pad(feature[..., 1:] - feature[..., :-1], (0, 1, 0, 0))
+            gy = F.pad(feature[..., 1:, :] - feature[..., :-1, :], (0, 0, 0, 1))
+            return torch.sigmoid(self.head(torch.cat([feature, gx.abs(), gy.abs()], dim=1)))
+
+    class PolarTokenizer(nn.Module):
+        def __init__(self, channels: int, dim: int, rings: int, sectors: int):
+            super().__init__()
+            self.rings, self.sectors = rings, sectors
+            self.radius_steps = nn.Parameter(torch.zeros(rings))
+            self.angle_offset = nn.Parameter(torch.zeros(1))
+            self.project = nn.Conv2d(channels, dim, 1)
+        def centre_scale(self, mask):
+            b, _, h, w = mask.shape
+            yy = torch.linspace(-1, 1, h, device=mask.device, dtype=mask.dtype)
+            xx = torch.linspace(-1, 1, w, device=mask.device, dtype=mask.dtype)
+            yg, xg = torch.meshgrid(yy, xx, indexing="ij")
+            weight = mask[:, 0] + 1e-6; weight = weight / weight.sum((1, 2), keepdim=True)
+            cx = (weight * xg).sum((1, 2)); cy = (weight * yg).sum((1, 2))
+            variance = weight * ((xg - cx[:, None, None]) ** 2 + (yg - cy[:, None, None]) ** 2)
+            scale = torch.clamp(torch.sqrt(variance.sum((1, 2)) + 1e-6) * 2.8, 0.35, 1.25)
+            return cx, cy, scale
+        def forward(self, feature, mask):
+            projected = self.project(feature)
+            cx, cy, scale = self.centre_scale(mask)
+            radii = torch.cumsum(F.softplus(self.radius_steps) + 1e-3, 0); radii = radii / radii[-1]
+            angles = torch.arange(self.sectors, device=feature.device, dtype=feature.dtype) * (2 * math.pi / self.sectors) + self.angle_offset
+            rr = radii[None, :, None] * scale[:, None, None]; aa = angles[None, None, :]
+            grid = torch.stack([cx[:, None, None] + rr * torch.cos(aa), cy[:, None, None] + rr * torch.sin(aa)], dim=-1)
+            polar = F.grid_sample(projected, grid, mode="bilinear", padding_mode="border", align_corners=True)
+            polar_mask = F.grid_sample(mask, grid, mode="bilinear", padding_mode="border", align_corners=True)
+            return polar, polar_mask, grid, (cx, cy, scale)
