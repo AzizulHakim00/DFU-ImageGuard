@@ -1,0 +1,30 @@
+{
+  "primary_model": "DFU-ImageGuard",
+  "primary_rank_by_balanced_accuracy": 3,
+  "best_model_by_balanced_accuracy": "MobileNetV3",
+  "primary_balanced_accuracy": 0.9738000690607735,
+  "primary_sensitivity": 0.953125,
+  "primary_specificity": 0.994475138121547,
+  "primary_roc_auc": 0.9928673169889503,
+  "primary_false_negatives": 24,
+  "superiority_supported_against_all_baselines": false,
+  "external_validation_performed": false,
+  "multi_seed_performed": false,
+  "q1_high_impact_ready": false,
+  "mandatory_remaining_evidence": [
+    "genuine independent external validation with overlap audit",
+    "pre-registered five-seed final comparison",
+    "visual review of XAI overlays",
+    "independent error/label review",
+    "dataset licensing clarification"
+  ],
+  "allowed_claim": "Competitive duplicate-group-aware OOF discrimination with high specificity; no statistically supported superiority or deployment claim.",
+  "blocked_claims": [
+    "state of the art",
+    "significantly outperforms all baselines",
+    "patient-level validation",
+    "external generalisation",
+    "clinical deployment readiness",
+    "XAI proves clinical correctness"
+  ]
+}
