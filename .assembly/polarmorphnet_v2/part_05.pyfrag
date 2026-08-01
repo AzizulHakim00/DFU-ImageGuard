@@ -1,0 +1,135 @@
+
+
+def mask_regularization(mask):
+    import torch
+
+    tv = (mask[..., 1:] - mask[..., :-1]).abs().mean() + (mask[..., 1:, :] - mask[..., :-1, :]).abs().mean()
+    area = (mask.mean((1, 2, 3)) - 0.25).abs().mean()
+    return tv + 0.25 * area
+
+
+def training_loss(logits, aux, labels, cluster_weight, cfg: Config):
+    import torch
+    import torch.nn.functional as F
+
+    classification = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+    if cfg.CLUSTER_WEIGHTED_LOSS:
+        classification = (classification * cluster_weight).sum() / cluster_weight.sum().clamp_min(1e-6)
+    else:
+        classification = classification.mean()
+    background = F.binary_cross_entropy_with_logits(aux["background_logits"], labels)
+    counterfactual = torch.tensor(0.0, device=labels.device)
+    if aux["counterfactual_logits"] is not None:
+        counterfactual = F.mse_loss(torch.sigmoid(aux["counterfactual_logits"]), torch.sigmoid(logits.detach()))
+    mask_loss = mask_regularization(aux["mask"])
+    total = classification + cfg.LAMBDA_BG * background + cfg.LAMBDA_CF * counterfactual + cfg.LAMBDA_MASK * mask_loss
+    return total, {
+        "classification": float(classification.detach()), "background": float(background.detach()),
+        "counterfactual": float(counterfactual.detach()), "mask": float(mask_loss.detach()),
+    }
+
+
+def predict_loader(model, loader, device, return_embeddings: bool = False) -> dict[str, np.ndarray]:
+    import torch
+
+    model.eval(); logits, labels, indices, embeddings = [], [], [], []
+    with torch.inference_mode():
+        for batch in loader:
+            images = batch["image"].to(device, non_blocking=True)
+            output, aux = model(images, return_aux=True)
+            logits.append(output.cpu().numpy()); labels.append(batch["label"].numpy()); indices.append(batch["index"].numpy())
+            if return_embeddings:
+                embeddings.append(aux["embedding"].cpu().numpy())
+    result = {
+        "logits": np.concatenate(logits), "labels": np.concatenate(labels).astype(int),
+        "indices": np.concatenate(indices).astype(int),
+    }
+    if return_embeddings:
+        result["embeddings"] = np.concatenate(embeddings)
+    return result
+
+
+def selection_auc(model, loader, device) -> float:
+    from sklearn.metrics import roc_auc_score
+
+    output = predict_loader(model, loader, device)
+    if len(np.unique(output["labels"])) < 2:
+        return float("nan")
+    probabilities = 1 / (1 + np.exp(-np.clip(output["logits"], -40, 40)))
+    return float(roc_auc_score(output["labels"], probabilities))
+
+
+def save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary); os.replace(temporary, path)
+
+
+def load_checkpoint(path: Path, cfg: Config, device, optimizer=None, scheduler=None, scaler=None):
+    import torch
+
+    payload = torch.load(path, map_location=device, weights_only=False)
+    if payload.get("architecture") != cfg.ARCHITECTURE:
+        raise RuntimeError(f"Checkpoint architecture mismatch: {payload.get('architecture')}")
+    model = instantiate_model(cfg).to(device); model.load_state_dict(payload["model_state"])
+    if optimizer is not None and "optimizer_state" in payload: optimizer.load_state_dict(payload["optimizer_state"])
+    if scheduler is not None and "scheduler_state" in payload: scheduler.load_state_dict(payload["scheduler_state"])
+    if scaler is not None and "scaler_state" in payload: scaler.load_state_dict(payload["scaler_state"])
+    return model, payload
+
+
+def train_fold_model(model, train_loader, selection_loader, cfg: Config, device, best_path: Path, latest_path: Path, history_path: Path, fold: int):
+    import torch
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, cfg.MAX_EPOCHS - cfg.WARMUP_EPOCHS), eta_min=cfg.MIN_LR)
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.AMP and device.type == "cuda")
+    start_epoch, best_auc, stale, history = 0, -np.inf, 0, []
+    if latest_path.exists() and not cfg.FORCE_RETRAIN:
+        model, payload = load_checkpoint(latest_path, cfg, device, optimizer, scheduler, scaler)
+        start_epoch = int(payload["epoch"]) + 1; best_auc = float(payload["best_auc"]); stale = int(payload["stale"])
+        history = list(payload.get("history", []))
+        print(f"Resuming fold {fold + 1} at epoch {start_epoch + 1}")
+    for epoch in range(start_epoch, cfg.MAX_EPOCHS):
+        model.train(); totals = []
+        if epoch < cfg.WARMUP_EPOCHS:
+            warm_lr = cfg.LR * (epoch + 1) / cfg.WARMUP_EPOCHS
+            for group in optimizer.param_groups: group["lr"] = warm_lr
+        for batch in train_loader:
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+            weights = batch["cluster_weight"].to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=cfg.AMP and device.type == "cuda"):
+                logits, aux = model(images, return_aux=True)
+                loss, components = training_loss(logits, aux, labels, weights, cfg)
+            scaler.scale(loss).backward(); scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(optimizer); scaler.update(); totals.append(float(loss.detach()))
+        if epoch >= cfg.WARMUP_EPOCHS: scheduler.step()
+        auc = selection_auc(model, selection_loader, device)
+        row = {"epoch": epoch + 1, "loss_total": float(np.mean(totals)), "selection_auc": auc, "lr": optimizer.param_groups[0]["lr"]}
+        row.update({f"last_{key}": value for key, value in components.items()}); history.append(row)
+        improved = np.isfinite(auc) and auc > best_auc + 1e-5
+        if improved:
+            best_auc, stale = auc, 0
+        else:
+            stale += 1
+        payload = {
+            "architecture": cfg.ARCHITECTURE, "config": asdict(cfg), "fold": fold + 1,
+            "epoch": epoch, "best_auc": best_auc, "stale": stale, "history": history,
+            "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict(), "scaler_state": scaler.state_dict(),
+        }
+        save_checkpoint(latest_path, payload)
+        if improved: save_checkpoint(best_path, payload)
+        write_csv(pd.DataFrame(history), history_path)
+        print(f"Fold {fold + 1} | epoch {epoch + 1:02d} | loss {row['loss_total']:.4f} | selection AUC {auc:.4f} | best {best_auc:.4f}")
+        if stale >= cfg.PATIENCE:
+            print(f"Fold {fold + 1}: early stopping")
+            break
+    model, _ = load_checkpoint(best_path, cfg, device)
+    latest_path.unlink(missing_ok=True)
+    return model, pd.DataFrame(history)
