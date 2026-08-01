@@ -1,0 +1,66 @@
+
+
+def load_saved_scientific_config(cfg: Config, dirs: dict[str, Path]) -> None:
+    path = dirs["configs"] / "resolved_config.json"
+    if not path.exists(): return
+    saved = json.loads(path.read_text()).get("scientific_config", {})
+    for key, value in saved.items():
+        if hasattr(cfg, key): setattr(cfg, key, value)
+
+
+def artifact_mode(cfg: Config) -> dict[str, Any]:
+    mount_drive(); project = Path(cfg.DRIVE_ROOT)
+    run = project / "runs" / cfg.RUN_ID if cfg.RUN_ID else find_latest_run(project)
+    if not run.exists(): raise FileNotFoundError(run)
+    cfg.RUN_ID = run.name; dirs = make_dirs(run); load_saved_scientific_config(cfg, dirs); cfg.MODE = "artifacts"
+    seed_everything(cfg.SEED); dataset_root = download_dataset(cfg, dirs)
+    manifest_path = dirs["manifests"] / "locked_manifest.csv"
+    if not manifest_path.exists(): raise FileNotFoundError(manifest_path)
+    manifest = remap_paths(pd.read_csv(manifest_path), dataset_root)
+    print("ARTIFACT-ONLY MODE: no model training will occur.")
+    return finalize_run(manifest, cfg, dirs)
+
+
+def upload_mode(cfg: Config) -> dict[str, Any]:
+    mount_drive(); project = Path(cfg.DRIVE_ROOT)
+    run = project / "runs" / cfg.RUN_ID if cfg.RUN_ID else find_latest_run(project)
+    if not run.exists(): raise FileNotFoundError(run)
+    cfg.RUN_ID = run.name; dirs = make_dirs(run); load_saved_scientific_config(cfg, dirs); cfg.MODE = "upload"
+    print("UPLOAD MODE: no model training or inference will occur.")
+    status = push_results_to_github(dirs, cfg); print(json.dumps(status, indent=2)); return status
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="DFU-PolarMorphNet V2 all-in-one research workflow")
+    parser.add_argument("--mode", choices=["train", "artifacts", "upload"], default=None)
+    parser.add_argument("--run-id", default=None); parser.add_argument("--drive-root", default=None)
+    parser.add_argument("--preferred-folds", default=None); parser.add_argument("--force-retrain", action="store_true")
+    parser.add_argument("--epochs", type=int, default=None); parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--no-xai", action="store_true"); parser.add_argument("--no-robustness", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> dict[str, Any]:
+    args = parse_args(); cfg = Config()
+    if args.mode: cfg.MODE = args.mode
+    if args.run_id: cfg.RUN_ID = args.run_id
+    if args.drive_root: cfg.DRIVE_ROOT = args.drive_root
+    if args.preferred_folds is not None: cfg.PREFERRED_FOLDS = args.preferred_folds
+    if args.force_retrain: cfg.FORCE_RETRAIN = True
+    if args.epochs: cfg.MAX_EPOCHS = args.epochs
+    if args.batch_size: cfg.BATCH_SIZE = args.batch_size
+    if args.no_xai: cfg.RUN_XAI = False
+    if args.no_robustness: cfg.RUN_ROBUSTNESS = False
+    print("=" * 92)
+    print("DFU-PolarMorphNet V2 | lesion-centred polar state-space architecture")
+    print(f"Mode={cfg.MODE} | FORCE_RETRAIN={cfg.FORCE_RETRAIN} | Drive={cfg.DRIVE_ROOT}")
+    print("No output is prefilled; saved checkpoints and CSVs are reused whenever available.")
+    print("=" * 92)
+    if cfg.MODE == "train": return train_mode(cfg)
+    if cfg.MODE == "artifacts": return artifact_mode(cfg)
+    if cfg.MODE == "upload": return upload_mode(cfg)
+    raise ValueError(cfg.MODE)
+
+
+if __name__ == "__main__":
+    main()
