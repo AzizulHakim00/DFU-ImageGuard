@@ -1,0 +1,120 @@
+
+
+def select_xai_cases(predictions: pd.DataFrame, limit: int) -> pd.DataFrame:
+    frame = predictions.copy()
+    frame["case"] = np.select([
+        (frame.label == 1) & (frame.pred_calibrated == 1),
+        (frame.label == 0) & (frame.pred_calibrated == 0),
+        (frame.label == 0) & (frame.pred_calibrated == 1),
+        (frame.label == 1) & (frame.pred_calibrated == 0),
+    ], ["true_positive", "true_negative", "false_positive", "false_negative"], default="other")
+    chosen = []
+    for case in ["false_negative", "false_positive", "true_positive", "true_negative"]:
+        subset = frame[frame.case == case]
+        if not subset.empty:
+            chosen.append(subset.sort_values("decision_confidence", ascending=False).iloc[0])
+    return pd.DataFrame(chosen).drop_duplicates("image_id").head(limit) if chosen else frame.head(0)
+
+
+def normalize_map(array: np.ndarray) -> np.ndarray:
+    array = np.asarray(array, dtype=float); array -= np.nanmin(array)
+    return array / max(float(np.nanmax(array)), 1e-8)
+
+
+def run_small_xai(predictions: pd.DataFrame, cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    import matplotlib.pyplot as plt
+    import torch
+    import torch.nn.functional as F
+
+    _, transform = build_transforms(cfg); device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    records = []
+    for _, row in select_xai_cases(predictions, cfg.XAI_CASES).iterrows():
+        fold = int(row.outer_fold); checkpoint = dirs["models"] / f"dfu_polarmorphnet_fold_{fold + 1}.pt"
+        model, _ = load_checkpoint(checkpoint, cfg, device); model.eval(); model.zero_grad(set_to_none=True)
+        with Image.open(row.image_path) as image:
+            original = image.convert("RGB").resize((cfg.IMAGE_SIZE, cfg.IMAGE_SIZE))
+        x = transform(original).unsqueeze(0).to(device)
+        logits, aux = model(x, return_aux=True); logits[0].backward()
+        feature, gradient = model.last_feature, model.last_feature.grad
+        if gradient is None:
+            raise RuntimeError("Grad-CAM gradient unavailable")
+        weights = gradient.mean((2, 3), keepdim=True)
+        cam = torch.relu((weights * feature).sum(1, keepdim=True))
+        cam = F.interpolate(cam, (cfg.IMAGE_SIZE, cfg.IMAGE_SIZE), mode="bilinear", align_corners=False)
+        lesion = F.interpolate(aux["mask"], (cfg.IMAGE_SIZE, cfg.IMAGE_SIZE), mode="bilinear", align_corners=False)
+        cam_np = normalize_map(cam[0, 0].detach().cpu().numpy()); lesion_np = normalize_map(lesion[0, 0].detach().cpu().numpy())
+        fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+        axes[0].imshow(original); axes[0].set_title("Original")
+        axes[1].imshow(original); axes[1].imshow(lesion_np, alpha=0.45); axes[1].set_title("Weak lesion map")
+        axes[2].imshow(original); axes[2].imshow(cam_np, alpha=0.45); axes[2].set_title("Held-out-fold Grad-CAM")
+        for axis in axes: axis.axis("off")
+        fig.suptitle(f"{row.case} | true={row.label_name} | p={row.prob_calibrated:.3f} | fold={fold + 1}")
+        base = dirs["xai"] / f"{row.image_id}_{row.case}_xai"; savefig(fig, base); plt.close(fig)
+        records.append({
+            "image_id": row.image_id, "case": row.case, "fold": fold + 1,
+            "true_label": int(row.label), "prediction": int(row.pred_calibrated),
+            "probability": float(row.prob_calibrated), "checkpoint": str(checkpoint),
+            "figure_png": str(base.with_suffix(".png")), "methods": "weak_lesion_map;gradcam",
+            "causality_claim": False, "clinical_localization_claim": False,
+        })
+        del model; gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+    output = pd.DataFrame(records); write_csv(output, dirs["tables"] / "xai_metadata.csv")
+    return output
+
+
+def corrupt_image(image: Image.Image, condition: str, seed: int) -> Image.Image:
+    if condition == "clean": return image
+    if condition == "blur_sigma_2": return image.filter(ImageFilter.GaussianBlur(2.0))
+    if condition == "brightness_0_7": return ImageEnhance.Brightness(image).enhance(0.7)
+    if condition == "jpeg_q30":
+        buffer = io.BytesIO(); image.save(buffer, format="JPEG", quality=30); buffer.seek(0)
+        return Image.open(buffer).convert("RGB")
+    if condition == "gaussian_noise_0_05":
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        rng = np.random.default_rng(seed); array = np.clip(array + rng.normal(0, 0.05, array.shape), 0, 1)
+        return Image.fromarray(np.uint8(array * 255))
+    if condition == "occlusion_20pct":
+        array = np.asarray(image).copy(); h, w = array.shape[:2]
+        side = int(math.sqrt(0.20) * min(h, w)); y, x = (h - side) // 2, (w - side) // 2
+        array[y:y + side, x:x + side] = 0; return Image.fromarray(array)
+    raise KeyError(condition)
+
+
+def run_small_robustness(manifest: pd.DataFrame, cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    import torch
+
+    _, transform = build_transforms(cfg); device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    conditions = ["clean", "gaussian_noise_0_05", "blur_sigma_2", "brightness_0_7", "jpeg_q30", "occlusion_20pct"]
+    rows = []
+    for fold in range(cfg.N_FOLDS):
+        subset = manifest[manifest.outer_fold == fold].copy()
+        if cfg.ROBUSTNESS_MAX_PER_FOLD > 0 and len(subset) > cfg.ROBUSTNESS_MAX_PER_FOLD:
+            subset = subset.sample(cfg.ROBUSTNESS_MAX_PER_FOLD, random_state=cfg.SEED + fold)
+        checkpoint = dirs["models"] / f"dfu_polarmorphnet_fold_{fold + 1}.pt"
+        calibration = json.loads((dirs["configs"] / f"calibration_fold_{fold + 1}.json").read_text())
+        model, _ = load_checkpoint(checkpoint, cfg, device); model.eval()
+        for condition in conditions:
+            logits, labels = [], []
+            with torch.inference_mode():
+                for start in range(0, len(subset), cfg.BATCH_SIZE):
+                    tensors, batch_labels = [], []
+                    for _, row in subset.iloc[start:start + cfg.BATCH_SIZE].iterrows():
+                        with Image.open(row.image_path) as image:
+                            changed = corrupt_image(image.convert("RGB"), condition, cfg.SEED + int(row.name))
+                        tensors.append(transform(changed)); batch_labels.append(int(row.label))
+                    batch = torch.stack(tensors).to(device); logits.append(model(batch).cpu().numpy()); labels.extend(batch_labels)
+            logits_np = np.concatenate(logits); labels_np = np.asarray(labels)
+            probability = sigmoid_np(logits_np / float(calibration["temperature"])); threshold = float(calibration["threshold"])
+            result = metric_dict(labels_np, probability, (probability >= threshold).astype(int), threshold)
+            rows.append({"fold": fold + 1, "condition": condition, **result})
+        del model; gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+    output = pd.DataFrame(rows); write_csv(output, dirs["tables"] / "small_robustness_results.csv")
+    summary = output.groupby("condition")[["balanced_accuracy", "sensitivity", "specificity", "ece"]].mean().reset_index()
+    write_csv(summary, dirs["tables"] / "small_robustness_summary.csv")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(9, 4)); summary.set_index("condition")[["balanced_accuracy", "sensitivity"]].plot(kind="bar", ax=ax)
+    ax.set_ylim(0, 1.02); ax.set_ylabel("Mean across folds"); ax.set_title("Small fixed-corruption robustness"); ax.tick_params(axis="x", rotation=25)
+    savefig(fig, dirs["figures"] / "small_robustness"); plt.close(fig)
+    return output
