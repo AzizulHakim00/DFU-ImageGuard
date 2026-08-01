@@ -1,0 +1,130 @@
+
+
+def add_embedding_groups(frame: pd.DataFrame, uf: UnionFind, cfg: Config, evidence: list[dict[str, Any]]) -> None:
+    if not cfg.EMBEDDING_DUPLICATES:
+        return
+    import torch
+    import timm
+    from torchvision import transforms
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = timm.create_model("resnet18.a1_in1k", pretrained=True, num_classes=0).to(device).eval()
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)), transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    vectors = []
+    with torch.inference_mode():
+        for start in range(0, len(frame), 32):
+            tensors = []
+            for path in frame.image_path.iloc[start:start + 32]:
+                with Image.open(path) as image:
+                    tensors.append(transform(image.convert("RGB")))
+            batch = torch.stack(tensors).to(device)
+            feature = model(batch)
+            feature = torch.nn.functional.normalize(feature, dim=1)
+            vectors.append(feature.cpu().numpy())
+    embedding = np.concatenate(vectors)
+    np.save(frame.attrs["embedding_path"], embedding)
+    for label, subset in frame.groupby("label"):
+        idx = subset.index.to_numpy()
+        similarity = embedding[idx] @ embedding[idx].T
+        rows, cols = np.where(np.triu(similarity, 1) >= cfg.EMBEDDING_SIMILARITY)
+        for row, col in zip(rows, cols):
+            a, b = int(idx[row]), int(idx[col])
+            uf.union(a, b)
+            evidence.append({"method": "embedding", "a": a, "b": b, "similarity": float(similarity[row, col]), "label": int(label)})
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def assign_groups(frame: pd.DataFrame, cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    frame = frame.reset_index(drop=True).copy()
+    frame.attrs["embedding_path"] = str(dirs["manifests"] / "audit_embeddings.npy")
+    uf, evidence = exact_and_phash_groups(frame, cfg)
+    add_embedding_groups(frame, uf, cfg, evidence)
+    roots = [uf.find(i) for i in range(len(frame))]
+    mapping = {root: f"grp_{position:04d}" for position, root in enumerate(sorted(set(roots)))}
+    frame["group_id"] = [mapping[root] for root in roots]
+    sizes = frame.group_id.value_counts()
+    frame["group_size"] = frame.group_id.map(sizes).astype(int)
+    frame["cluster_weight"] = 1.0 / frame.group_size
+    conflicts = frame.groupby("group_id").label.nunique()
+    conflicts = conflicts[conflicts > 1]
+    if not conflicts.empty:
+        write_csv(frame[frame.group_id.isin(conflicts.index)], dirs["tables"] / "cross_label_duplicate_conflicts.csv")
+        raise RuntimeError("Cross-label duplicate/near-duplicate groups detected; manual label audit required")
+    summary = frame.groupby("group_id").agg(n_images=("image_id", "size"), label=("label", "first")).reset_index()
+    write_csv(frame, dirs["manifests"] / "grouped_manifest.csv")
+    write_csv(summary, dirs["tables"] / "duplicate_groups.csv")
+    write_json(dirs["tables"] / "duplicate_evidence.json", evidence)
+    return frame
+
+
+def make_outer_folds(frame: pd.DataFrame, cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    from sklearn.model_selection import StratifiedGroupKFold
+
+    path = dirs["manifests"] / "outer_fold_assignments.csv"
+    if path.exists():
+        saved = pd.read_csv(path)
+        merged = frame.drop(columns=["outer_fold"], errors="ignore").merge(
+            saved[["image_id", "outer_fold"]], on="image_id", how="left", validate="one_to_one"
+        )
+        if merged.outer_fold.isna().any():
+            raise RuntimeError("Saved fold assignments do not match the audited manifest")
+        return merged
+    splitter = StratifiedGroupKFold(n_splits=cfg.N_FOLDS, shuffle=True, random_state=cfg.SEED)
+    frame = frame.copy()
+    frame["outer_fold"] = -1
+    for fold, (_, test_idx) in enumerate(splitter.split(frame, frame.label, frame.group_id)):
+        frame.loc[test_idx, "outer_fold"] = fold
+    if (frame.outer_fold < 0).any():
+        raise AssertionError("Incomplete outer fold assignment")
+    for group, subset in frame.groupby("group_id"):
+        if subset.outer_fold.nunique() != 1:
+            raise AssertionError(f"Group leakage for {group}")
+    write_csv(frame[["image_id", "relative_path", "label", "group_id", "outer_fold"]], path)
+    write_json(dirs["root"] / "split_integrity_report.json", {
+        "status": "PASS", "n_folds": cfg.N_FOLDS, "group_overlap": 0,
+        "patient_level_split": False, "reason": "patient/case identifiers unavailable",
+    })
+    return frame
+
+
+def make_inner_partition(outer_train: pd.DataFrame, fold: int, cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    from sklearn.model_selection import StratifiedGroupKFold
+
+    path = dirs["manifests"] / f"inner_partition_fold_{fold + 1}.csv"
+    if path.exists():
+        roles = pd.read_csv(path)
+        return outer_train.merge(roles[["image_id", "inner_role"]], on="image_id", how="left", validate="one_to_one")
+    first = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=cfg.SEED + fold + 100)
+    remain_idx, cal_idx = next(first.split(outer_train, outer_train.label, outer_train.group_id))
+    remain = outer_train.iloc[remain_idx].copy()
+    second = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=cfg.SEED + fold + 200)
+    train_idx, select_idx = next(second.split(remain, remain.label, remain.group_id))
+    role = pd.Series("", index=outer_train.index, dtype=object)
+    role.iloc[cal_idx] = "calibration"
+    role.loc[remain.iloc[train_idx].index] = "train"
+    role.loc[remain.iloc[select_idx].index] = "selection"
+    output = outer_train.copy()
+    output["inner_role"] = role
+    if (output.inner_role == "").any():
+        raise AssertionError("Incomplete inner partition")
+    for group, subset in output.groupby("group_id"):
+        if subset.inner_role.nunique() != 1:
+            raise AssertionError(f"Inner leakage for group {group}")
+    write_csv(output[["image_id", "group_id", "label", "inner_role"]], path)
+    return output
+
+
+def remap_paths(frame: pd.DataFrame, dataset_root: Path) -> pd.DataFrame:
+    patches = find_patches_root(dataset_root)
+    frame = frame.copy()
+    frame["image_path"] = frame.relative_path.map(lambda x: str(patches / x))
+    missing = [path for path in frame.image_path if not Path(path).exists()]
+    if missing:
+        raise FileNotFoundError(f"Could not remap {len(missing)} dataset paths")
+    return frame
