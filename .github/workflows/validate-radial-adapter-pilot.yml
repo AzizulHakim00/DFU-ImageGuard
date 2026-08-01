@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pytest torch numpy pandas
+      - run: pip install pytest torch numpy pandas Pillow
       - run: python -m py_compile src/checkpoint_backup.py src/radial_adapter_model.py src/radial_pilot_core.py src/radial_pilot_runner.py
       - run: pytest -q tests/test_radial_adapter_geometry.py tests/test_verdict_logic.py tests/test_checkpoint_chunking.py
       - name: Compile notebook cells
