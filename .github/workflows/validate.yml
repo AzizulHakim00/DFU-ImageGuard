@@ -6,25 +6,72 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
+      - name: Checkout repository head
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Assemble verified PolarMorphNet source when staged
+        id: assemble
+        shell: bash
+        run: |
+          if ! compgen -G '.assembly/polarmorphnet/chunk_*.b64' > /dev/null; then
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python - <<'PY'
+          from pathlib import Path
+          import base64, hashlib
+
+          chunks = sorted(Path('.assembly/polarmorphnet').glob('chunk_*.b64'))
+          encoded = ''.join(path.read_text(encoding='utf-8') for path in chunks)
+          data = base64.b64decode(encoded, validate=True)
+          expected_sha = '75f358b68e5fd36fe3490adfb62cd3e359815b7970e36a0ab4f2b86a72ed9b47'
+          actual_sha = hashlib.sha256(data).hexdigest()
+          if actual_sha != expected_sha:
+              raise SystemExit(f'SHA-256 mismatch: {actual_sha} != {expected_sha}')
+          destination = Path('polarmorphnet/DFU_PolarMorphNet_AllInOne.py')
+          destination.parent.mkdir(parents=True, exist_ok=True)
+          destination.write_bytes(data)
+          print(f'Assembled {destination} | bytes={len(data)} | sha256={actual_sha}')
+          PY
+          rm -rf .assembly/polarmorphnet
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install validators and lightweight test dependencies
         run: python -m pip install --disable-pip-version-check ruff==0.12.5 numpy pandas pillow
+
       - name: Compile Python sources
         run: python -m compileall -q src scripts polarmorphnet
+
       - name: Detect undefined names
         run: ruff check src scripts polarmorphnet --select F821,F822,F823
+
       - name: Validate notebooks and required structure
         run: python scripts/validate_repository.py
+
       - name: Test resilient runtime file writes
         run: PYTHONPATH=. python scripts/test_runtime_io.py
+
+      - name: Commit verified assembled source to PR branch
+        if: steps.assemble.outputs.changed == 'true' && github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- polarmorphnet/DFU_PolarMorphNet_AllInOne.py
+          git add -u -- .assembly/polarmorphnet
+          git commit -m 'Assemble verified DFU-PolarMorphNet all-in-one source'
+          git push origin HEAD:${{ github.head_ref }}
