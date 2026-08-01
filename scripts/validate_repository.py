@@ -13,7 +13,9 @@ REQUIRED = [
     "src/statistics_figures.py",
     "src/robustness_xai.py",
     "src/artifacts.py",
+    "src/runtime_io.py",
     "src/dfu_imageguard_pipeline.py",
+    "scripts/test_runtime_io.py",
     "notebooks/DFU_ImageGuard_Conference_Complete.ipynb",
     "notebooks/DFU_ImageGuard_Load_Artifacts.ipynb",
     "notebooks/DFU_ImageGuard_Upload_Existing_Run.ipynb",
@@ -23,6 +25,8 @@ if missing:
     raise SystemExit(f"Missing required files: {missing}")
 
 for py_path in sorted((ROOT / "src").glob("*.py")):
+    ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+for py_path in sorted((ROOT / "scripts").glob("*.py")):
     ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
 
 for nb_path in sorted((ROOT / "notebooks").rglob("*.ipynb")):
