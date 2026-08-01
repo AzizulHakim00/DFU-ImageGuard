@@ -1,0 +1,115 @@
+
+
+def lease_path(dirs: dict[str, Path], fold: int) -> Path:
+    return dirs["locks"] / f"fold_{fold + 1}.lock.json"
+
+
+def claim_fold(dirs: dict[str, Path], fold: int, cfg: Config) -> bool:
+    path = lease_path(dirs, fold)
+    if path.exists():
+        age_hours = (time.time() - path.stat().st_mtime) / 3600
+        if age_hours > cfg.FOLD_LEASE_HOURS:
+            path.unlink(missing_ok=True)
+        else:
+            return False
+    payload = {"fold": fold + 1, "claimed_at": utcnow(), "pid": os.getpid(), "host": platform.node()}
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle: json.dump(payload, handle, indent=2)
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_fold(dirs: dict[str, Path], fold: int) -> None:
+    lease_path(dirs, fold).unlink(missing_ok=True)
+
+
+def fold_complete(dirs: dict[str, Path], fold: int) -> bool:
+    return all([
+        (dirs["models"] / f"dfu_polarmorphnet_fold_{fold + 1}.pt").exists(),
+        (dirs["predictions"] / f"oof_fold_{fold + 1}.csv").exists(),
+        (dirs["configs"] / f"calibration_fold_{fold + 1}.json").exists(),
+    ])
+
+
+def run_fold(fold: int, manifest: pd.DataFrame, cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    import torch
+
+    train_transform, eval_transform = build_transforms(cfg)
+    outer_train = manifest[manifest.outer_fold != fold].copy()
+    outer_test = manifest[manifest.outer_fold == fold].copy().reset_index(drop=True)
+    inner = make_inner_partition(outer_train, fold, cfg, dirs)
+    train_frame = inner[inner.inner_role == "train"].copy()
+    selection_frame = inner[inner.inner_role == "selection"].copy()
+    calibration_frame = inner[inner.inner_role == "calibration"].copy()
+    train_loader = build_loader(train_frame, train_transform, cfg, True, cfg.SEED + fold)
+    selection_loader = build_loader(selection_frame, eval_transform, cfg, False, cfg.SEED + 1000 + fold)
+    calibration_loader = build_loader(calibration_frame, eval_transform, cfg, False, cfg.SEED + 2000 + fold)
+    test_loader = build_loader(outer_test, eval_transform, cfg, False, cfg.SEED + 3000 + fold)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    best_path = dirs["models"] / f"dfu_polarmorphnet_fold_{fold + 1}.pt"
+    latest_path = dirs["models"] / f"dfu_polarmorphnet_fold_{fold + 1}_latest.pt"
+    history_path = dirs["logs"] / f"history_fold_{fold + 1}.csv"
+    prediction_path = dirs["predictions"] / f"oof_fold_{fold + 1}.csv"
+    if cfg.FORCE_RETRAIN:
+        for path in [best_path, latest_path, prediction_path, dirs["configs"] / f"calibration_fold_{fold + 1}.json"]:
+            path.unlink(missing_ok=True)
+    trained_now = not best_path.exists() or latest_path.exists()
+    model = instantiate_model(cfg).to(device)
+    if trained_now:
+        model, history = train_fold_model(model, train_loader, selection_loader, cfg, device, best_path, latest_path, history_path, fold)
+    else:
+        model, _ = load_checkpoint(best_path, cfg, device)
+        history = pd.read_csv(history_path) if history_path.exists() else pd.DataFrame()
+        print(f"Fold {fold + 1}: reusing completed checkpoint; no training")
+
+    calibration_output = predict_loader(model, calibration_loader, device)
+    temperature = fit_temperature(calibration_output["logits"], calibration_output["labels"])
+    calibration_probability = sigmoid_np(calibration_output["logits"] / temperature)
+    threshold, threshold_info = select_threshold(calibration_output["labels"], calibration_probability, cfg.TARGET_SENSITIVITY)
+    test_output = predict_loader(model, test_loader, device, return_embeddings=True)
+    frame = prediction_frame(outer_test, test_output, temperature, threshold, fold)
+    write_csv(frame, prediction_path)
+    np.save(dirs["predictions"] / f"oof_embeddings_fold_{fold + 1}.npy", test_output["embeddings"])
+    calibration_info = {
+        "fold": fold + 1, "temperature": temperature, "threshold": threshold,
+        "threshold_selection": threshold_info, "n_train": len(train_frame),
+        "n_selection": len(selection_frame), "n_calibration": len(calibration_frame),
+        "n_outer_test": len(outer_test), "checkpoint": str(best_path),
+        "checkpoint_sha256": sha256_file(best_path), "parameter_count": parameter_count(model),
+        "trained_now": trained_now, "architecture": cfg.ARCHITECTURE,
+    }
+    write_json(dirs["configs"] / f"calibration_fold_{fold + 1}.json", calibration_info)
+    result = metric_dict(frame.label, frame.prob_calibrated, frame.pred_calibrated, threshold)
+    live = pd.DataFrame([{**result, "fold": fold + 1, "temperature": temperature, "trained_now": trained_now}])
+    display_df(live, f"Fold {fold + 1} completed result")
+    if not history.empty:
+        for path in fold_figures(history, frame, fold, dirs): display_image(path)
+    registry_path = dirs["logs"] / "primary_fit_registry.json"
+    registry = json.loads(registry_path.read_text()) if registry_path.exists() else []
+    registry = [item for item in registry if item.get("fold") != fold + 1] + [calibration_info]
+    write_json(registry_path, sorted(registry, key=lambda item: item["fold"]))
+    del model; gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    return frame
+
+
+def gather_oof(cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    paths = [dirs["predictions"] / f"oof_fold_{fold + 1}.csv" for fold in range(cfg.N_FOLDS)]
+    missing = [path.name for path in paths if not path.exists()]
+    if missing: raise FileNotFoundError(f"Incomplete folds: {missing}")
+    output = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
+    if output.image_id.duplicated().any(): raise AssertionError("Duplicate OOF image IDs")
+    write_csv(output, dirs["predictions"] / "dfu_polarmorphnet_oof_predictions.csv")
+    return output
+
+
+def model_registry(cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    rows = []
+    for fold in range(cfg.N_FOLDS):
+        path = dirs["models"] / f"dfu_polarmorphnet_fold_{fold + 1}.pt"
+        if path.exists():
+            rows.append({"fold": fold + 1, "checkpoint": str(path), "sha256": sha256_file(path), "size_mb": path.stat().st_size / 1024**2, "architecture": cfg.ARCHITECTURE})
+    output = pd.DataFrame(rows); write_csv(output, dirs["tables"] / "model_registry.csv")
+    return output
