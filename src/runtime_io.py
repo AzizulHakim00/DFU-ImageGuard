@@ -10,12 +10,24 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-_INSTALLED = False
-_ORIGINAL_NP_SAVE = np.save
-_ORIGINAL_NP_SAVEZ = np.savez
-_ORIGINAL_NP_SAVEZ_COMPRESSED = np.savez_compressed
-_ORIGINAL_TO_CSV = pd.DataFrame.to_csv
-_ORIGINAL_IMAGE_SAVE = Image.Image.save
+_SENTINEL = "_dfu_imageguard_runtime_io_installed"
+
+if not hasattr(np, "_dfu_imageguard_original_save"):
+    np._dfu_imageguard_original_save = np.save
+if not hasattr(np, "_dfu_imageguard_original_savez"):
+    np._dfu_imageguard_original_savez = np.savez
+if not hasattr(np, "_dfu_imageguard_original_savez_compressed"):
+    np._dfu_imageguard_original_savez_compressed = np.savez_compressed
+if not hasattr(pd.DataFrame, "_dfu_imageguard_original_to_csv"):
+    pd.DataFrame._dfu_imageguard_original_to_csv = pd.DataFrame.to_csv
+if not hasattr(Image.Image, "_dfu_imageguard_original_save"):
+    Image.Image._dfu_imageguard_original_save = Image.Image.save
+
+_ORIGINAL_NP_SAVE = np._dfu_imageguard_original_save
+_ORIGINAL_NP_SAVEZ = np._dfu_imageguard_original_savez
+_ORIGINAL_NP_SAVEZ_COMPRESSED = np._dfu_imageguard_original_savez_compressed
+_ORIGINAL_TO_CSV = pd.DataFrame._dfu_imageguard_original_to_csv
+_ORIGINAL_IMAGE_SAVE = Image.Image._dfu_imageguard_original_save
 
 
 def _path_from_target(target: Any) -> Path | None:
@@ -152,12 +164,11 @@ def storage_write_probe(root: str | Path) -> dict[str, Any]:
 
 
 def install_runtime_io_guards() -> None:
-    global _INSTALLED
-    if _INSTALLED:
+    if getattr(np, _SENTINEL, False):
         return
     np.save = resilient_np_save
     np.savez = resilient_np_savez
     np.savez_compressed = resilient_np_savez_compressed
     pd.DataFrame.to_csv = resilient_to_csv
     Image.Image.save = resilient_image_save
-    _INSTALLED = True
+    setattr(np, _SENTINEL, True)
