@@ -972,7 +972,7 @@ def display_image(path: Path) -> None:
 def savefig(fig, base: Path) -> None:
     base.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(base.with_suffix(".png"), dpi=300, bbox_inches="tight")
-    fig.savefig(base.with_suffix(".pdf"), bbox_inches_inches="tight")
+    fig.savefig(base.with_suffix(".pdf"), bbox_inches="tight")
 
 
 def fold_figures(history: pd.DataFrame, frame: pd.DataFrame, fold: int, dirs: dict[str, Path]) -> list[Path]:
@@ -1446,7 +1446,7 @@ def push_results_to_github(dirs: dict[str, Path], cfg: Config) -> dict[str, Any]
         changed = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=work).returncode != 0
         if changed: subprocess.run(["git", "commit", "-m", f"Add PolarMorphNet run {cfg.RUN_ID}"], cwd=work, check=True, capture_output=True, text=True)
         authenticated = f"https://x-access-token:{token}@github.com/{cfg.REPO}.git"
-        subprocess.run(["git", "push", authenticated, f"HEAD:{branch}", "--force-with-lease"], cwd=work, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "push", authenticated, f"HEAD:{branch}", "--force"], cwd=work, check=True, capture_output=True, text=True)
         status["commit_sha"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=work, text=True).strip(); status["success"] = True
     except Exception as exc:
         status["error"] = repr(exc)
@@ -1584,10 +1584,20 @@ def train_mode(cfg: Config) -> dict[str, Any]:
     if not all(complete):
         print("Resume with the same RUN_ID and shared DRIVE_ROOT. Allocate only missing folds on other accounts.")
         return progress
-    verification = finalize_run(manifest, cfg, dirs)
-    (project / "LAST_COMPLETED_POLARMORPHNET_RUN.txt").write_text(cfg.RUN_ID + "\n")
-    (project / "ACTIVE_POLARMORPHNET_RUN.txt").unlink(missing_ok=True)
-    return verification
+    final_lock = dirs["locks"] / "finalize.lock"
+    try:
+        descriptor = os.open(final_lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        os.close(descriptor)
+    except FileExistsError:
+        print("Another Colab account is performing final aggregation; no duplicate finalization started.")
+        return progress
+    try:
+        verification = finalize_run(manifest, cfg, dirs)
+        (project / "LAST_COMPLETED_POLARMORPHNET_RUN.txt").write_text(cfg.RUN_ID + "\n")
+        (project / "ACTIVE_POLARMORPHNET_RUN.txt").unlink(missing_ok=True)
+        return verification
+    finally:
+        final_lock.unlink(missing_ok=True)
 
 
 def load_saved_scientific_config(cfg: Config, dirs: dict[str, Path]) -> None:
