@@ -1,0 +1,66 @@
+name: Validate and assemble DFU-PolarMorphNet V2
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate-polarmorphnet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Assemble compact single-file source
+        id: assemble
+        shell: bash
+        run: |
+          if compgen -G '.assembly/polarmorphnet_v2/part_*.pyfrag' > /dev/null; then
+            mkdir -p polarmorphnet
+            cat $(find .assembly/polarmorphnet_v2 -name 'part_*.pyfrag' | sort) > polarmorphnet/DFU_PolarMorphNet_AllInOne.py
+            sha256sum polarmorphnet/DFU_PolarMorphNet_AllInOne.py | awk '{print $1}' > polarmorphnet/SOURCE_SHA256.txt
+            rm -rf .assembly/polarmorphnet .assembly/polarmorphnet_v2
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install lightweight validation dependencies
+        run: python -m pip install --disable-pip-version-check ruff==0.12.5 numpy pandas pillow
+
+      - name: Compile all Python sources
+        run: python -m compileall -q src scripts polarmorphnet
+
+      - name: Detect undefined names
+        run: ruff check src scripts polarmorphnet --select F821,F822,F823
+
+      - name: Validate source command line
+        run: python polarmorphnet/DFU_PolarMorphNet_AllInOne.py --help
+
+      - name: Validate repository and one-cell notebooks
+        run: python scripts/validate_repository.py
+
+      - name: Test resilient runtime file writes
+        run: PYTHONPATH=. python scripts/test_runtime_io.py
+
+      - name: Commit validated single-file source
+        if: steps.assemble.outputs.changed == 'true' && github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- polarmorphnet/DFU_PolarMorphNet_AllInOne.py polarmorphnet/SOURCE_SHA256.txt
+          git add -u -- .assembly/polarmorphnet .assembly/polarmorphnet_v2
+          git commit -m 'Assemble validated DFU-PolarMorphNet V2 single-file source'
+          git push origin HEAD:${{ github.head_ref }}

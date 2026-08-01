@@ -58,10 +58,40 @@ def _retry(operation: Callable[[], Any], target: Any, attempts: int = 4) -> Any:
     raise last_error
 
 
-def resilient_np_save(file: Any, arr: Any, allow_pickle: bool = True, fix_imports: bool = True) -> None:
+def _original_np_save_compatible(
+    target: Any,
+    arr: Any,
+    allow_pickle: bool,
+    fix_imports: bool,
+) -> None:
+    """Call NumPy save across 1.x and 2.x signatures.
+
+    NumPy 2.4 removed the deprecated ``fix_imports`` keyword. Older Colab
+    environments still accept it, so try the historical signature first and
+    fall back only when that exact keyword is rejected.
+    """
+    try:
+        _ORIGINAL_NP_SAVE(
+            target,
+            arr,
+            allow_pickle=allow_pickle,
+            fix_imports=fix_imports,
+        )
+    except TypeError as exc:
+        if "fix_imports" not in str(exc):
+            raise
+        _ORIGINAL_NP_SAVE(target, arr, allow_pickle=allow_pickle)
+
+
+def resilient_np_save(
+    file: Any,
+    arr: Any,
+    allow_pickle: bool = True,
+    fix_imports: bool = True,
+) -> None:
     path = _path_from_target(file)
     if path is None:
-        _ORIGINAL_NP_SAVE(file, arr, allow_pickle=allow_pickle, fix_imports=fix_imports)
+        _original_np_save_compatible(file, arr, allow_pickle, fix_imports)
         return
 
     if path.suffix != ".npy":
@@ -72,7 +102,12 @@ def resilient_np_save(file: Any, arr: Any, allow_pickle: bool = True, fix_import
         temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
         try:
             with temporary.open("wb") as handle:
-                _ORIGINAL_NP_SAVE(handle, arr, allow_pickle=allow_pickle, fix_imports=fix_imports)
+                _original_np_save_compatible(
+                    handle,
+                    arr,
+                    allow_pickle,
+                    fix_imports,
+                )
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
@@ -82,7 +117,12 @@ def resilient_np_save(file: Any, arr: Any, allow_pickle: bool = True, fix_import
     _retry(write_once, path)
 
 
-def _resilient_npz(original: Callable[..., Any], file: Any, *args: Any, **kwargs: Any) -> None:
+def _resilient_npz(
+    original: Callable[..., Any],
+    file: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
     path = _path_from_target(file)
     if path is None:
         original(file, *args, **kwargs)
@@ -110,7 +150,12 @@ def resilient_np_savez_compressed(file: Any, *args: Any, **kwargs: Any) -> None:
     _resilient_npz(_ORIGINAL_NP_SAVEZ_COMPRESSED, file, *args, **kwargs)
 
 
-def resilient_to_csv(self: pd.DataFrame, path_or_buf: Any = None, *args: Any, **kwargs: Any) -> Any:
+def resilient_to_csv(
+    self: pd.DataFrame,
+    path_or_buf: Any = None,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     path = _path_from_target(path_or_buf)
     if path is None:
         return _ORIGINAL_TO_CSV(self, path_or_buf, *args, **kwargs)
@@ -122,7 +167,12 @@ def resilient_to_csv(self: pd.DataFrame, path_or_buf: Any = None, *args: Any, **
     return _retry(write_once, path)
 
 
-def resilient_image_save(self: Image.Image, fp: Any, *args: Any, **kwargs: Any) -> Any:
+def resilient_image_save(
+    self: Image.Image,
+    fp: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
     path = _path_from_target(fp)
     if path is None:
         return _ORIGINAL_IMAGE_SAVE(self, fp, *args, **kwargs)
@@ -149,7 +199,10 @@ def storage_write_probe(root: str | Path) -> dict[str, Any]:
         npy_path.exists()
         and csv_path.exists()
         and image_path.exists()
-        and np.array_equal(np.load(npy_path), np.asarray([1, 2, 3], dtype=np.int64))
+        and np.array_equal(
+            np.load(npy_path),
+            np.asarray([1, 2, 3], dtype=np.int64),
+        )
     )
     for path in [npy_path, csv_path, image_path]:
         path.unlink(missing_ok=True)

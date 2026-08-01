@@ -1,29 +1,29 @@
-name: Validate DFU-ImageGuard
+name: Assemble DFU-PolarMorphNet single-file source
 
 on:
+  workflow_dispatch:
   push:
-    branches: [main]
-  pull_request:
+    paths:
+      - '.assembly/polarmorphnet/**'
 
 permissions:
   contents: write
 
 jobs:
-  validate:
+  assemble:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository head
+      - name: Checkout current branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.head_ref || github.ref_name }}
+          ref: ${{ github.ref_name }}
           fetch-depth: 0
 
-      - name: Assemble verified PolarMorphNet source when staged
-        id: assemble
+      - name: Assemble and verify source
         shell: bash
         run: |
           if ! compgen -G '.assembly/polarmorphnet/chunk_*.b64' > /dev/null; then
-            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            echo 'No PolarMorphNet assembly chunks remain; nothing to do.'
             exit 0
           fi
           python - <<'PY'
@@ -42,36 +42,19 @@ jobs:
           destination.write_bytes(data)
           print(f'Assembled {destination} | bytes={len(data)} | sha256={actual_sha}')
           PY
+          python -m py_compile polarmorphnet/DFU_PolarMorphNet_AllInOne.py
           rm -rf .assembly/polarmorphnet
-          echo 'changed=true' >> "$GITHUB_OUTPUT"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install validators and lightweight test dependencies
-        run: python -m pip install --disable-pip-version-check ruff==0.12.5 numpy pandas pillow
-
-      - name: Compile Python sources
-        run: python -m compileall -q src scripts polarmorphnet
-
-      - name: Detect undefined names
-        run: ruff check src scripts polarmorphnet --select F821,F822,F823
-
-      - name: Validate notebooks and required structure
-        run: python scripts/validate_repository.py
-
-      - name: Test resilient runtime file writes
-        run: PYTHONPATH=. python scripts/test_runtime_io.py
-
-      - name: Commit verified assembled source to PR branch
-        if: steps.assemble.outputs.changed == 'true' && github.event_name == 'pull_request'
+      - name: Commit assembled source
         shell: bash
         run: |
+          if git diff --quiet -- polarmorphnet/DFU_PolarMorphNet_AllInOne.py .assembly/polarmorphnet; then
+            echo 'No assembled changes to commit.'
+            exit 0
+          fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -- polarmorphnet/DFU_PolarMorphNet_AllInOne.py
           git add -u -- .assembly/polarmorphnet
-          git commit -m 'Assemble verified DFU-PolarMorphNet all-in-one source'
-          git push origin HEAD:${{ github.head_ref }}
+          git commit -m 'Assemble DFU-PolarMorphNet all-in-one source'
+          git push origin HEAD:${{ github.ref_name }}
