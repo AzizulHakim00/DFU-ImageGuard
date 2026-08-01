@@ -27,4 +27,4 @@ jobs:
       - name: Validate notebooks and required structure
         run: python scripts/validate_repository.py
       - name: Test resilient runtime file writes
-        run: python scripts/test_runtime_io.py
+        run: PYTHONPATH=. python scripts/test_runtime_io.py
