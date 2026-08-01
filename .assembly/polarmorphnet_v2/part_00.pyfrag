@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+"""DFU-PolarMorphNet V2: one-file, resumable, leakage-safe Colab research workflow.
+
+The file deliberately contains the architecture, data audit, training, calibration,
+figures, XAI, robustness, reproducibility bundle and GitHub export. It never
+contains precomputed results and is not a medical device.
+"""
+
+import argparse
+import contextlib
+import dataclasses
+import datetime as dt
+import gc
+import hashlib
+import io
+import json
+import math
+import os
+import pickle
+import platform
+import random
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageEnhance, ImageFilter
+
+
+@dataclass
+class Config:
+    REPO: str = "AzizulHakim00/DFU-ImageGuard"
+    DATASET_SLUG: str = "laithjj/diabetic-foot-ulcer-dfu"
+    ARCHITECTURE: str = "DFU-PolarMorphNet-V2"
+    MODE: str = os.getenv("DFU_MODE", "train")
+    RUN_ID: Optional[str] = os.getenv("DFU_RUN_ID") or None
+    DRIVE_ROOT: str = os.getenv("DFU_DRIVE_ROOT", "/content/drive/MyDrive/DFU-PolarMorphNet")
+    PREFERRED_FOLDS: str = os.getenv("DFU_PREFERRED_FOLDS", "")
+    SEED: int = 2026
+    N_FOLDS: int = 5
+    IMAGE_SIZE: int = 224
+    BATCH_SIZE: int = 8
+    NUM_WORKERS: int = 2
+    MAX_EPOCHS: int = 35
+    PATIENCE: int = 7
+    LR: float = 3e-4
+    MIN_LR: float = 1e-6
+    WEIGHT_DECAY: float = 1e-4
+    WARMUP_EPOCHS: int = 2
+    AMP: bool = True
+    TARGET_SENSITIVITY: float = 0.95
+    BOOTSTRAP_REPS: int = 1000
+    PHASH_DISTANCE: int = 4
+    EMBEDDING_DUPLICATES: bool = True
+    EMBEDDING_SIMILARITY: float = 0.995
+    CLUSTER_BALANCED_SAMPLER: bool = True
+    CLUSTER_WEIGHTED_LOSS: bool = True
+    STEM_DIM: int = 64
+    EMBED_DIM: int = 192
+    RADIAL_RINGS: int = 8
+    ANGULAR_SECTORS: int = 24
+    DROPOUT: float = 0.25
+    DROP_PATH: float = 0.12
+    LAMBDA_BG: float = 0.08
+    LAMBDA_CF: float = 0.12
+    LAMBDA_MASK: float = 0.04
+    BG_GRL_LAMBDA: float = 0.20
+    RUN_XAI: bool = True
+    XAI_CASES: int = 4
+    RUN_ROBUSTNESS: bool = True
+    ROBUSTNESS_MAX_PER_FOLD: int = 128
+    FORCE_RETRAIN: bool = False
+    GITHUB_PUSH: bool = True
+    GITHUB_MAX_FILE_MB: int = 90
+    FOLD_LEASE_HOURS: float = 24.0
+
+    @property
+    def preferred_fold_indices(self) -> list[int]:
+        if not self.PREFERRED_FOLDS.strip():
+            return list(range(self.N_FOLDS))
+        values = sorted({int(x.strip()) - 1 for x in self.PREFERRED_FOLDS.split(",") if x.strip()})
+        if any(x < 0 or x >= self.N_FOLDS for x in values):
+            raise ValueError("PREFERRED_FOLDS must contain fold numbers 1..5")
+        return values
+
+
+def in_colab() -> bool:
+    return "google.colab" in sys.modules or Path("/content").exists()
+
+
+def utcnow() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def run_id_now() -> str:
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_csv(frame: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def seed_everything(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    import torch
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def seed_worker(worker_id: int) -> None:
+    seed = (os.getpid() + worker_id + int(time.time())) % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def mount_drive() -> None:
+    if not in_colab():
+        return
+    from google.colab import drive
+
+    drive.mount("/content/drive", force_remount=False)
+
+
+def make_dirs(root: Path) -> dict[str, Path]:
+    names = ["models", "predictions", "manifests", "configs", "tables", "figures", "xai", "robustness", "logs", "locks"]
+    dirs = {"root": root}
+    root.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        dirs[name] = root / name
+        dirs[name].mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def resolve_run(cfg: Config) -> tuple[Path, dict[str, Path]]:
+    mount_drive()
+    project = Path(cfg.DRIVE_ROOT)
+    project.mkdir(parents=True, exist_ok=True)
+    active = project / "ACTIVE_POLARMORPHNET_RUN.txt"
+    if cfg.RUN_ID is None:
+        candidate = active.read_text().strip() if active.exists() else ""
+        cfg.RUN_ID = candidate if candidate and (project / "runs" / candidate).exists() else run_id_now()
+    active.write_text(cfg.RUN_ID + "\n", encoding="utf-8")
+    return project, make_dirs(project / "runs" / cfg.RUN_ID)
