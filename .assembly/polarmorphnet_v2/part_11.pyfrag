@@ -1,0 +1,60 @@
+
+
+def get_github_token() -> Optional[str]:
+    token = os.getenv("GITHUB_TOKEN")
+    if token: return token.strip()
+    try:
+        from google.colab import userdata
+        value = userdata.get("GITHUB_TOKEN")
+        return value.strip() if value else None
+    except Exception:
+        return None
+
+
+def copy_github_safe(dirs: dict[str, Path], cfg: Config, destination: Path) -> list[dict[str, Any]]:
+    if destination.exists(): shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    skipped = []; limit = cfg.GITHUB_MAX_FILE_MB * 1024**2
+    allowed = {"tables", "figures", "xai", "configs", "manifests", "logs", "predictions", "robustness"}
+    for path in dirs["root"].rglob("*"):
+        if not path.is_file(): continue
+        relative = path.relative_to(dirs["root"])
+        if relative.parts[0] == "models" or path.suffix == ".npy":
+            skipped.append({"path": str(path), "sha256": sha256_file(path), "reason": "drive_only_model_or_embedding"}); continue
+        if relative.parts[0] not in allowed and len(relative.parts) > 1: continue
+        if path.stat().st_size > limit:
+            skipped.append({"path": str(path), "sha256": sha256_file(path), "reason": "github_size_limit"}); continue
+        target = destination / relative; target.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(path, target)
+    write_json(destination / "drive_only_or_oversized_artifacts.json", skipped)
+    return skipped
+
+
+def push_results_to_github(dirs: dict[str, Path], cfg: Config) -> dict[str, Any]:
+    status = {"attempted": False, "success": False, "branch": None, "commit_sha": None, "error": None}
+    if not cfg.GITHUB_PUSH:
+        status["error"] = "disabled"; write_json(dirs["root"] / "github_push_status.json", status); return status
+    token = get_github_token()
+    if not token:
+        status["error"] = "GITHUB_TOKEN unavailable"; write_json(dirs["root"] / "github_push_status.json", status); return status
+    status["attempted"] = True; branch = f"polarmorphnet-results/{cfg.RUN_ID}"; status["branch"] = branch
+    work = Path("/content/polarmorphnet_git_export") if in_colab() else dirs["root"] / ".git_export"
+    try:
+        if work.exists(): shutil.rmtree(work)
+        subprocess.run(["git", "clone", "--depth", "1", f"https://github.com/{cfg.REPO}.git", str(work)], check=True, capture_output=True, text=True)
+        subprocess.run(["git", "checkout", "-B", branch], cwd=work, check=True, capture_output=True, text=True)
+        target = work / "results" / "polarmorphnet" / cfg.RUN_ID
+        copy_github_safe(dirs, cfg, target)
+        latest = work / "results" / "polarmorphnet" / "LATEST_RUN.txt"; latest.parent.mkdir(parents=True, exist_ok=True); latest.write_text(cfg.RUN_ID + "\n")
+        subprocess.run(["git", "config", "user.name", "DFU-PolarMorphNet Colab"], cwd=work, check=True)
+        subprocess.run(["git", "config", "user.email", "actions@users.noreply.github.com"], cwd=work, check=True)
+        subprocess.run(["git", "add", "--", str(target.relative_to(work)), str(latest.relative_to(work))], cwd=work, check=True)
+        changed = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=work).returncode != 0
+        if changed: subprocess.run(["git", "commit", "-m", f"Add PolarMorphNet run {cfg.RUN_ID}"], cwd=work, check=True, capture_output=True, text=True)
+        authenticated = f"https://x-access-token:{token}@github.com/{cfg.REPO}.git"
+        subprocess.run(["git", "push", authenticated, f"HEAD:{branch}", "--force-with-lease"], cwd=work, check=True, capture_output=True, text=True)
+        status["commit_sha"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=work, text=True).strip(); status["success"] = True
+    except Exception as exc:
+        status["error"] = repr(exc)
+    finally:
+        write_json(dirs["root"] / "github_push_status.json", status)
+    return status
