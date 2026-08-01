@@ -1,0 +1,116 @@
+
+
+def download_dataset(cfg: Config, dirs: dict[str, Path]) -> Path:
+    import kagglehub
+
+    root = Path(kagglehub.dataset_download(cfg.DATASET_SLUG))
+    write_json(dirs["root"] / "dataset_source.json", {
+        "slug": cfg.DATASET_SLUG, "downloaded_at": utcnow(), "cache_root": str(root),
+        "license": "unknown_or_undeclared; verify before redistribution",
+    })
+    return root
+
+
+def find_patches_root(root: Path) -> Path:
+    candidates = [p for p in root.rglob("*") if p.is_dir() and p.name.lower() == "patches"]
+    for candidate in sorted(candidates, key=lambda p: len(p.parts)):
+        child_names = {p.name.lower() for p in candidate.iterdir() if p.is_dir()}
+        if any("normal" in n for n in child_names) and any(any(k in n for k in ("abnormal", "ulcer", "dfu")) for n in child_names):
+            return candidate
+    raise RuntimeError("Strict Patches/Normal and Patches/Abnormal-or-Ulcer folders were not found")
+
+
+def class_from_relative(relative: Path) -> tuple[int, str]:
+    first = relative.parts[0].lower()
+    if "normal" in first and not any(k in first for k in ("abnormal", "ulcer", "dfu")):
+        return 0, "Normal"
+    if any(k in first for k in ("abnormal", "ulcer", "dfu")):
+        return 1, "DFU"
+    raise ValueError(f"Ambiguous class folder: {relative.parts[0]}")
+
+
+def pixel_hash(image: Image.Image) -> str:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return hashlib.sha256(array.tobytes()).hexdigest()
+
+
+def build_manifest(dataset_root: Path, cfg: Config, dirs: dict[str, Path]) -> pd.DataFrame:
+    import imagehash
+
+    patches = find_patches_root(dataset_root)
+    extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+    rows, corrupt = [], []
+    for path in sorted(patches.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in extensions:
+            continue
+        relative = path.relative_to(patches)
+        try:
+            label, label_name = class_from_relative(relative)
+            with Image.open(path) as image:
+                image.verify()
+            with Image.open(path) as image:
+                rgb = image.convert("RGB")
+                width, height = rgb.size
+                rows.append({
+                    "image_id": hashlib.sha256(relative.as_posix().encode()).hexdigest()[:20],
+                    "image_path": str(path), "relative_path": relative.as_posix(),
+                    "label": label, "label_name": label_name, "width": width, "height": height,
+                    "file_sha256": sha256_file(path), "pixel_sha256": pixel_hash(rgb),
+                    "phash": str(imagehash.phash(rgb, hash_size=16)),
+                })
+        except Exception as exc:
+            corrupt.append({"path": str(path), "error": repr(exc)})
+    frame = pd.DataFrame(rows)
+    if frame.empty or frame.label.nunique() != 2:
+        raise RuntimeError("Dataset audit did not produce both strict classes")
+    write_csv(frame, dirs["manifests"] / "raw_manifest.csv")
+    write_csv(pd.DataFrame(corrupt), dirs["tables"] / "corrupt_images.csv")
+    return frame
+
+
+class UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+
+
+def phash_distance(a: str, b: str) -> int:
+    return (int(a, 16) ^ int(b, 16)).bit_count()
+
+
+def exact_and_phash_groups(frame: pd.DataFrame, cfg: Config) -> tuple[UnionFind, list[dict[str, Any]]]:
+    uf = UnionFind(len(frame))
+    evidence: list[dict[str, Any]] = []
+    for column, method in [("file_sha256", "file_sha256"), ("pixel_sha256", "pixel_sha256")]:
+        for _, indices in frame.groupby(column).groups.items():
+            indices = list(indices)
+            for index in indices[1:]:
+                uf.union(indices[0], index)
+            if len(indices) > 1:
+                evidence.append({"method": method, "members": indices, "size": len(indices)})
+    for label, subset in frame.groupby("label"):
+        indices = subset.index.to_list()
+        hashes = subset.phash.to_list()
+        for i in range(len(indices)):
+            for j in range(i + 1, len(indices)):
+                distance = phash_distance(hashes[i], hashes[j])
+                if distance <= cfg.PHASH_DISTANCE:
+                    uf.union(indices[i], indices[j])
+                    evidence.append({"method": "phash", "a": indices[i], "b": indices[j], "distance": distance, "label": int(label)})
+    return uf, evidence
