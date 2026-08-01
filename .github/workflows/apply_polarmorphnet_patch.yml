@@ -1,0 +1,64 @@
+name: Apply and validate DFU-PolarMorphNet patch
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Apply staged patch
+        id: patch
+        shell: bash
+        run: |
+          if [ -f .assembly/polarmorphnet_patch.py ]; then
+            python .assembly/polarmorphnet_patch.py
+            sha256sum polarmorphnet/DFU_PolarMorphNet_AllInOne.py | awk '{print $1}' > polarmorphnet/SOURCE_SHA256.txt
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install lightweight validation dependencies
+        run: python -m pip install --disable-pip-version-check ruff==0.12.5 numpy pandas pillow
+
+      - name: Compile all Python sources
+        run: python -m compileall -q src scripts polarmorphnet
+
+      - name: Detect undefined names
+        run: ruff check src scripts polarmorphnet --select F821,F822,F823
+
+      - name: Validate source command line
+        run: python polarmorphnet/DFU_PolarMorphNet_AllInOne.py --help
+
+      - name: Validate repository and one-cell notebooks
+        run: python scripts/validate_repository.py
+
+      - name: Test resilient runtime file writes
+        run: PYTHONPATH=. python scripts/test_runtime_io.py
+
+      - name: Commit validated patch
+        if: steps.patch.outputs.changed == 'true' && github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- polarmorphnet/DFU_PolarMorphNet_AllInOne.py polarmorphnet/SOURCE_SHA256.txt
+          git add -u -- .assembly/polarmorphnet_patch.py
+          git commit -m 'Harden DFU-PolarMorphNet multi-account finalization and export'
+          git push origin HEAD:${{ github.head_ref }}
