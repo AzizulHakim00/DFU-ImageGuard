@@ -1,26 +1,28 @@
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
 import time
 import uuid
-from getpass import getpass
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+
+def _run(args: list[str], *, cwd: Path | None = None, input_text: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args,
+        cwd=str(cwd) if cwd else None,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def _is_mountpoint(path: Path) -> bool:
     try:
-        return subprocess.run(
-            ["mountpoint", "-q", str(path)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode == 0
+        return _run(["mountpoint", "-q", str(path)]).returncode == 0
     except Exception:
         return False
 
@@ -51,12 +53,7 @@ def _clean_stale_mount(drive_module: Any, mount_point: Path) -> None:
 
     if _is_mountpoint(mount_point):
         try:
-            subprocess.run(
-                ["fusermount", "-uz", str(mount_point)],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            _run(["fusermount", "-uz", str(mount_point)])
         except Exception:
             pass
         time.sleep(1)
@@ -105,64 +102,111 @@ def mount_drive_verified(max_attempts: int = 3) -> Path:
     )
 
 
-def _read_secret_safely() -> str:
-    token = os.getenv("GITHUB_TOKEN", "").strip()
-    if token:
-        return token
-
+def _secret_value(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
     try:
         from google.colab import userdata
 
-        token = userdata.get("GITHUB_TOKEN")
-        if token:
-            return str(token).strip()
-    except Exception as exc:
-        print(f"Colab secret GITHUB_TOKEN is unavailable: {type(exc).__name__}")
-
-    print("\nGitHub token is required only for automatic backup pushes.")
-    print("Paste it in the hidden prompt below. It will stay only in this runtime and will not be written to Drive or GitHub.")
-    token = getpass("GitHub token (hidden): ").strip()
-    if not token:
-        raise RuntimeError(
-            "No GitHub token was provided. Training was NOT started. "
-            "Create a token with repository write access, then rerun."
-        )
-    return token
+        value = userdata.get(name)
+        return str(value).strip() if value else ""
+    except Exception:
+        return ""
 
 
-def _validate_token(token: str, repository: str = "AzizulHakim00/DFU-ImageGuard") -> str:
-    request = Request(
-        f"https://api.github.com/repos/{repository}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "DFU-RadialAdapter-Colab",
-        },
+def _token_from_gh_cli() -> str:
+    if shutil.which("gh") is None:
+        return ""
+    result = _run(["gh", "auth", "token"])
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _token_from_git_credential() -> str:
+    result = _run(
+        ["git", "credential", "fill"],
+        input_text="protocol=https\nhost=github.com\n\n",
     )
-    try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raise RuntimeError(f"GitHub token validation failed with HTTP {exc.code}. Training was NOT started.") from exc
-    except URLError as exc:
-        raise RuntimeError(f"GitHub token validation could not reach GitHub: {exc}. Training was NOT started.") from exc
+    if result.returncode != 0:
+        return ""
+    fields: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields[key.strip()] = value.strip()
+    return fields.get("password", "")
 
-    permissions = payload.get("permissions") or {}
-    if not permissions.get("push", False):
-        raise RuntimeError(
-            "The GitHub token can read the repository but does not have push permission. "
-            "Grant repository Contents: Read and write, then rerun. Training was NOT started."
-        )
-    owner = (payload.get("owner") or {}).get("login", "authenticated user")
-    print(f"GitHub token verified with push access for {repository} ({owner}).")
-    return token
+
+def discover_github_auth() -> tuple[str, str]:
+    for name in ("GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT"):
+        token = _secret_value(name)
+        if token:
+            return token, name
+
+    token = _token_from_gh_cli()
+    if token:
+        return token, "gh auth"
+
+    token = _token_from_git_credential()
+    if token:
+        return token, "git credential helper"
+
+    return "", "none"
+
+
+def _push_dry_run(repository_dir: Path, token: str = "") -> tuple[bool, str]:
+    branch = f"radial-auth-check-{uuid.uuid4().hex[:12]}"
+    command = ["git", "push", "--dry-run", "origin", f"HEAD:refs/heads/{branch}"]
+    if token:
+        import base64
+
+        raw = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        command = [
+            "git",
+            "-c",
+            f"http.extraHeader=Authorization: Basic {raw}",
+            "push",
+            "--dry-run",
+            "origin",
+            f"HEAD:refs/heads/{branch}",
+        ]
+    result = _run(command, cwd=repository_dir)
+    message = (result.stderr or result.stdout).strip()
+    return result.returncode == 0, message[-600:]
+
+
+def configure_github_backup(repository_dir: Path) -> tuple[bool, str]:
+    token, source = discover_github_auth()
+
+    # First test the already configured terminal/git authentication exactly as the user has it.
+    ok, message = _push_dry_run(repository_dir, token="")
+    if ok:
+        os.environ.pop("GITHUB_TOKEN", None)
+        print("GitHub push access verified using existing terminal/Git credentials.")
+        return True, "existing git credentials"
+
+    # Then test any token discovered from environment, Colab Secrets, gh, or credential helper.
+    if token:
+        ok, token_message = _push_dry_run(repository_dir, token=token)
+        if ok:
+            os.environ["GITHUB_TOKEN"] = token
+            print(f"GitHub push access verified using {source}.")
+            return True, source
+        message = token_message or message
+
+    print("GitHub push authentication is not currently usable.")
+    print("Training WILL continue because primary and SHA-256-verified secondary Drive backups are active.")
+    print("GitHub export will be marked PENDING and can be synced later without retraining.")
+    if message:
+        print("Git authentication detail:", message.replace(token, "***") if token else message)
+    os.environ.pop("GITHUB_TOKEN", None)
+    return False, "pending authentication"
 
 
 def launch_radial_pilot(repository_dir: str | Path = "/content/DFU-ImageGuard-radial") -> dict[str, Any]:
     project_root = mount_drive_verified()
-    token = _validate_token(_read_secret_safely())
-    os.environ["GITHUB_TOKEN"] = token
+    repository_dir = Path(repository_dir)
+    github_ready, auth_source = configure_github_backup(repository_dir)
 
     from .radial_pilot_runner import PilotSettings, run_radial_adapter_pilot
 
@@ -176,12 +220,13 @@ def launch_radial_pilot(repository_dir: str | Path = "/content/DFU-ImageGuard-ra
         patience=7,
         batch_size=16,
         num_workers=2,
-        github_export=True,
-        github_export_required=True,
+        github_export=github_ready,
+        github_export_required=False,
         github_branch="radial-pilot-results",
         github_chunk_full_checkpoints=True,
         github_chunk_bytes=48 * 1024 * 1024,
         github_export_after_each_trial=True,
         require_secondary_drive_backup=True,
+        github_auth_source=auth_source,
     )
-    return run_radial_adapter_pilot(settings=settings, repository_dir=Path(repository_dir))
+    return run_radial_adapter_pilot(settings=settings, repository_dir=repository_dir)
