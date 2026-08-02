@@ -42,6 +42,25 @@ MODEL_SPECS: dict[str, ModelSpec] = {
 }
 
 
+def _backbone_output_features(backbone: Any) -> int:
+    """Return the dimension produced by a timm model with num_classes=0.
+
+    Most timm models expose the final pooled dimension as ``num_features``.
+    MobileNetV3 additionally retains a 1280-dimensional pre-classifier head
+    after ``num_classes=0`` while ``num_features`` still reports 960.  In that
+    case ``head_hidden_size`` is the actual forward-output dimension.
+    """
+
+    head_hidden = int(getattr(backbone, "head_hidden_size", 0) or 0)
+    num_features = int(getattr(backbone, "num_features", 0) or 0)
+    output_features = head_hidden or num_features
+    if output_features <= 0:
+        raise RuntimeError(
+            "The timm backbone does not expose a valid pooled feature dimension"
+        )
+    return output_features
+
+
 class BinaryImageClassifier:
     """Thin timm wrapper with an explicit dropout and one-logit head."""
 
@@ -59,7 +78,8 @@ class BinaryImageClassifier:
                 super().__init__()
                 self.backbone = backbone
                 self.dropout = nn.Dropout(float(dropout))
-                self.head = nn.Linear(int(backbone.num_features), 1)
+                self.feature_dim = _backbone_output_features(backbone)
+                self.head = nn.Linear(self.feature_dim, 1)
                 self.model_key = model_key
                 self.resolved_name = resolved_name
 
@@ -67,6 +87,11 @@ class BinaryImageClassifier:
                 features = self.backbone(x)
                 if features.ndim > 2:
                     features = features.flatten(1)
+                if features.ndim != 2 or features.shape[1] != self.feature_dim:
+                    raise RuntimeError(
+                        f"Unexpected pooled feature shape {tuple(features.shape)} "
+                        f"for {self.resolved_name}; expected (*, {self.feature_dim})"
+                    )
                 return self.head(self.dropout(features)).squeeze(1)
 
         return _Impl()
@@ -94,8 +119,6 @@ def create_classifier(
                 num_classes=0,
                 global_pool="avg",
             )
-            if not hasattr(backbone, "num_features"):
-                raise RuntimeError(f"{name} does not expose num_features")
             model = BinaryImageClassifier(
                 backbone=backbone,
                 model_key=model_key,
@@ -122,6 +145,7 @@ def parameter_summary(model) -> dict[str, int]:
         "trainable_parameters": trainable,
         "backbone_parameters": backbone,
         "head_parameters": head,
+        "pooled_feature_dimension": int(model.feature_dim),
     }
 
 
