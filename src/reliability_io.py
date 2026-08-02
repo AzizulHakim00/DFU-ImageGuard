@@ -21,6 +21,7 @@ from .config_data import (
 )
 from .reliability_models import MODEL_SPECS
 
+
 @dataclass
 class ReliabilitySettings:
     run_id: str = "DFU_RELIABILITY_FINAL_V1"
@@ -84,17 +85,8 @@ class ReliabilitySettings:
 
 
 DIRECTORIES = (
-    "tables",
-    "figures",
-    "models",
-    "predictions",
-    "logs",
-    "configs",
-    "manifests",
-    "cache",
-    "xai",
-    "robustness",
-    "external",
+    "tables", "figures", "models", "predictions", "logs", "configs",
+    "manifests", "cache", "xai", "robustness", "external",
 )
 
 
@@ -131,8 +123,13 @@ def _inside(path: Path, parent: Path) -> bool:
 
 def _file_manifest(root: Path) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
+    excluded = {"ARTIFACT_MANIFEST.json"}
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name.endswith(".tmp"):
+        if (
+            not path.is_file()
+            or path.name.endswith(".tmp")
+            or path.name in excluded
+        ):
             continue
         rel = str(path.relative_to(root))
         result[rel] = {
@@ -158,7 +155,11 @@ def _copy_tree_verified(source: Path, destination: Path) -> dict[str, Any]:
     }
 
 
-def _sync_trial_verified(trial_dir: Path, run_root: Path, settings: ReliabilitySettings) -> dict[str, Any]:
+def _sync_trial_verified(
+    trial_dir: Path,
+    run_root: Path,
+    settings: ReliabilitySettings,
+) -> dict[str, Any]:
     relative = trial_dir.relative_to(run_root)
     destination = (
         Path(settings.secondary_drive_root)
@@ -175,7 +176,10 @@ def _sync_trial_verified(trial_dir: Path, run_root: Path, settings: ReliabilityS
     return status
 
 
-def mirror_full_run(run_root: Path, settings: ReliabilitySettings) -> dict[str, Any]:
+def mirror_full_run(
+    run_root: Path,
+    settings: ReliabilitySettings,
+) -> dict[str, Any]:
     destination = Path(settings.secondary_drive_root) / "runs" / settings.run_id
     status = _copy_tree_verified(run_root, destination)
     atomic_json(run_root / "SECONDARY_BACKUP_STATUS.json", status)
@@ -186,7 +190,9 @@ def mirror_full_run(run_root: Path, settings: ReliabilitySettings) -> dict[str, 
     return status
 
 
-def persistence_preflight(settings: ReliabilitySettings) -> tuple[Path, dict[str, Path]]:
+def persistence_preflight(
+    settings: ReliabilitySettings,
+) -> tuple[Path, dict[str, Path]]:
     settings.validate()
     drive_root = Path(settings.drive_root)
     secondary_root = Path(settings.secondary_drive_root)
@@ -196,7 +202,9 @@ def persistence_preflight(settings: ReliabilitySettings) -> tuple[Path, dict[str
     if settings.require_secondary_backup and not any(
         root.exists() and _inside(secondary_root, root) for root in allowed
     ):
-        raise RuntimeError(f"Secondary persistent Drive path is invalid: {secondary_root}")
+        raise RuntimeError(
+            f"Secondary persistent Drive path is invalid: {secondary_root}"
+        )
 
     run_root = drive_root / "runs" / settings.run_id
     run_root.mkdir(parents=True, exist_ok=True)
@@ -205,7 +213,9 @@ def persistence_preflight(settings: ReliabilitySettings) -> tuple[Path, dict[str
         dirs[name] = run_root / name
         dirs[name].mkdir(parents=True, exist_ok=True)
 
-    nonce = hashlib.sha256(f"{time.time_ns()}-{settings.run_id}".encode()).hexdigest()
+    nonce = hashlib.sha256(
+        f"{time.time_ns()}-{settings.run_id}".encode()
+    ).hexdigest()
     primary_marker = run_root / "PRIMARY_DRIVE_SENTINEL.json"
     atomic_json(primary_marker, {"nonce": nonce, "run_root": str(run_root)})
     if json.loads(primary_marker.read_text())["nonce"] != nonce:
@@ -214,7 +224,10 @@ def persistence_preflight(settings: ReliabilitySettings) -> tuple[Path, dict[str
     secondary_run = secondary_root / "runs" / settings.run_id
     secondary_run.mkdir(parents=True, exist_ok=True)
     secondary_marker = secondary_run / "SECONDARY_DRIVE_SENTINEL.json"
-    atomic_json(secondary_marker, {"nonce": nonce, "run_root": str(secondary_run)})
+    atomic_json(
+        secondary_marker,
+        {"nonce": nonce, "run_root": str(secondary_run)},
+    )
     if json.loads(secondary_marker.read_text())["nonce"] != nonce:
         raise RuntimeError("Secondary Drive write/read verification failed")
 
@@ -228,7 +241,9 @@ def persistence_preflight(settings: ReliabilitySettings) -> tuple[Path, dict[str
             "seeds": list(settings.seeds),
             "outer_folds": settings.n_folds,
             "expected_training_trials": (
-                len(settings.model_keys) * len(settings.seeds) * settings.n_folds
+                len(settings.model_keys)
+                * len(settings.seeds)
+                * settings.n_folds
             ),
             "test_set_role": "final inference only",
             "selection_role": "early stopping only",
@@ -263,7 +278,11 @@ def _prepare_locked_manifest(
     dirs: dict[str, Path],
 ) -> pd.DataFrame:
     dataset_root = download_dataset(cfg, dirs)
-    current = assign_duplicate_groups(build_manifest(dataset_root, cfg, dirs), cfg, dirs)
+    current = assign_duplicate_groups(
+        build_manifest(dataset_root, cfg, dirs),
+        cfg,
+        dirs,
+    )
     locked_path = dirs["manifests"] / "locked_outer_fold_assignments.csv"
     if locked_path.exists():
         old = pd.read_csv(locked_path)
@@ -285,7 +304,9 @@ def _prepare_locked_manifest(
         if not (merged.label == merged.locked_label).all():
             raise RuntimeError("Label changed relative to locked assignment")
         if not (merged.group_id == merged.locked_group).all():
-            raise RuntimeError("Duplicate grouping changed relative to locked assignment")
+            raise RuntimeError(
+                "Duplicate grouping changed relative to locked assignment"
+            )
         manifest = merged.drop(columns=["locked_label", "locked_group"])
         manifest.outer_fold = manifest.outer_fold.astype(int)
         atomic_csv(manifest, locked_path)
@@ -293,8 +314,12 @@ def _prepare_locked_manifest(
         manifest = make_outer_folds(current, cfg, dirs)
 
     for fold in range(cfg.N_FOLDS):
-        train_groups = set(manifest.loc[manifest.outer_fold != fold, "group_id"])
-        test_groups = set(manifest.loc[manifest.outer_fold == fold, "group_id"])
+        train_groups = set(
+            manifest.loc[manifest.outer_fold != fold, "group_id"]
+        )
+        test_groups = set(
+            manifest.loc[manifest.outer_fold == fold, "group_id"]
+        )
         if train_groups & test_groups:
             raise AssertionError(f"Duplicate-group leakage in fold {fold + 1}")
     atomic_json(
