@@ -8,6 +8,7 @@ on:
       - "src/reliable_*"
       - "tests/test_reliable_framework.py"
       - "notebooks/DFU_Reliable_*"
+      - ".github/workflows/validate-reliable-dfu-framework.yml"
 
 jobs:
   validate:
@@ -17,8 +18,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pytest numpy pandas scikit-learn
-      - run: python -m py_compile src/reliable_models.py src/reliable_analysis.py src/reliable_runner.py
+      - run: pip install pytest numpy pandas scikit-learn Pillow
+      - run: python -m py_compile src/reliable_models.py src/reliable_analysis.py src/reliable_external.py src/reliable_runner.py
       - run: pytest -q tests/test_reliable_framework.py
       - name: Compile notebook cells
         run: |
