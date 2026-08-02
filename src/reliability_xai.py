@@ -41,7 +41,11 @@ def select_gradcam_cases(
         selected = bucket.head(per_bucket).copy()
         selected["xai_category"] = category
         pieces.append(selected)
-    return pd.concat(pieces, ignore_index=True).head(limit)
+    return (
+        pd.concat(pieces, ignore_index=True)
+        .drop_duplicates(subset=["image_id"], keep="first")
+        .head(limit)
+    )
 
 
 def gradcam_image(model, image_tensor, target_layer, target_positive: bool):
@@ -53,12 +57,9 @@ def gradcam_image(model, image_tensor, target_layer, target_positive: bool):
 
     def forward_hook(_module, _inputs, output):
         activations.append(output)
-
-    def backward_hook(_module, _grad_input, grad_output):
-        gradients.append(grad_output[0])
+        output.register_hook(lambda grad: gradients.append(grad))
 
     forward_handle = target_layer.register_forward_hook(forward_hook)
-    backward_handle = target_layer.register_full_backward_hook(backward_hook)
     try:
         model.zero_grad(set_to_none=True)
         logit = model(image_tensor).reshape(-1)[0]
@@ -79,7 +80,6 @@ def gradcam_image(model, image_tensor, target_layer, target_positive: bool):
         return cam.detach().cpu().numpy(), float(logit.detach().cpu())
     finally:
         forward_handle.remove()
-        backward_handle.remove()
 
 
 def generate_gradcam(
