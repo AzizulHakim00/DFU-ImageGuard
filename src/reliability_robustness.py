@@ -16,6 +16,7 @@ from .reliability_io import ReliabilitySettings, _sync_trial_verified, atomic_cs
 from .reliability_models import create_classifier
 from .reliability_training import _augment_metrics, _device, _trial_paths
 
+
 class CorruptionTransform:
     def __init__(self, image_size: int, kind: str, severity: float, seed: int):
         self.image_size = int(image_size)
@@ -40,10 +41,15 @@ class CorruptionTransform:
             buffer.seek(0)
             image = Image.open(buffer).convert("RGB")
         elif self.kind == "rotation":
-            image = image.rotate(self.severity, resample=Image.Resampling.BILINEAR)
+            image = image.rotate(
+                self.severity,
+                resample=Image.Resampling.BILINEAR,
+            )
         tensor = TF.to_tensor(image)
         if self.kind == "gaussian_noise":
-            pixel_seed = self.seed + int(float(tensor.sum()) * 1000) % 1_000_003
+            pixel_seed = (
+                self.seed + int(float(tensor.sum()) * 1000) % 1_000_003
+            )
             generator = torch.Generator().manual_seed(pixel_seed)
             noise = torch.randn(tensor.shape, generator=generator) * self.severity
             tensor = (tensor + noise).clamp(0, 1)
@@ -76,6 +82,15 @@ def _run_trial_robustness(
     if model_key != settings.primary_model_key or not settings.run_robustness:
         return pd.DataFrame()
     paths = _trial_paths(run_root, model_key, seed, fold)
+    saved_predictions = paths["root"] / "robustness_predictions.csv"
+    saved_metrics = paths["root"] / "robustness_metrics.csv"
+    if (
+        saved_predictions.exists()
+        and saved_metrics.exists()
+        and not settings.force_retrain
+    ):
+        return pd.read_csv(saved_predictions)
+
     device = _device()
     payload = torch.load(paths["best"], map_location=device, weights_only=False)
     model = create_classifier(
@@ -98,7 +113,9 @@ def _run_trial_robustness(
                 severity,
                 seed + fold * 1000 + level_index,
             )
-            generator = torch.Generator().manual_seed(seed + fold * 1000 + level_index)
+            generator = torch.Generator().manual_seed(
+                seed + fold * 1000 + level_index
+            )
             loader = DataLoader(
                 FrameDataset(base, transform),
                 batch_size=cfg.BATCH_SIZE,
@@ -125,7 +142,9 @@ def _run_trial_robustness(
                     **metrics,
                 }
             )
-            prediction = base[["image_id", "group_id", "label", "relative_path"]].copy()
+            prediction = base[
+                ["image_id", "group_id", "label", "relative_path"]
+            ].copy()
             prediction["model_key"] = model_key
             prediction["seed"] = int(seed)
             prediction["outer_fold"] = int(fold + 1)
@@ -139,7 +158,10 @@ def _run_trial_robustness(
             prediction_frames.append(prediction)
     predictions = pd.concat(prediction_frames, ignore_index=True)
     atomic_csv(predictions, paths["root"] / "robustness_predictions.csv")
-    atomic_csv(pd.DataFrame(metric_rows), paths["root"] / "robustness_metrics.csv")
+    atomic_csv(
+        pd.DataFrame(metric_rows),
+        paths["root"] / "robustness_metrics.csv",
+    )
     if settings.require_secondary_backup:
         _sync_trial_verified(paths["root"], run_root, settings)
     del model
