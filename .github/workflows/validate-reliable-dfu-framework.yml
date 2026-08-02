@@ -1,0 +1,32 @@
+name: Validate reliable DFU framework
+
+on:
+  push:
+    branches: [reliable-dfu-framework-v1]
+  pull_request:
+    paths:
+      - "src/reliable_*"
+      - "tests/test_reliable_framework.py"
+      - "notebooks/DFU_Reliable_*"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest numpy pandas scikit-learn
+      - run: python -m py_compile src/reliable_models.py src/reliable_analysis.py src/reliable_runner.py
+      - run: pytest -q tests/test_reliable_framework.py
+      - name: Compile notebook cells
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          for path in pathlib.Path('notebooks').glob('DFU_Reliable_*OneCell.ipynb'):
+              nb=json.loads(path.read_text())
+              code='\n'.join(''.join(c.get('source',[])) for c in nb['cells'] if c['cell_type']=='code')
+              compile(code,str(path),'exec')
+              print('PASS',path)
+          PY
