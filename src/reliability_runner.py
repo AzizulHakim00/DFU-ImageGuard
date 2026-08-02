@@ -180,15 +180,19 @@ def run_reliability_experiment(
             protocol=pickle.HIGHEST_PROTOCOL,
         )
 
-    atomic_json(run_root / "ARTIFACT_MANIFEST.json", _file_manifest(run_root))
-    secondary = mirror_full_run(run_root, settings)
     checkpoint_count = len(list((run_root / "trials").rglob("best_model.pt")))
+    resume_count = len(list((run_root / "trials").rglob("last_resume.pt")))
     portable_count = len(
         list((run_root / "trials").rglob("best_model_portable_fp16.pt"))
     )
     prediction_count = len(
         list((run_root / "trials").rglob("test_predictions.csv"))
     )
+    calibration_count = len(
+        list((run_root / "trials").rglob("calibration_predictions.csv"))
+    )
+    metrics_count = len(list((run_root / "trials").rglob("metrics.json")))
+    secondary = mirror_full_run(run_root, settings)
     final = {
         "run_id": settings.run_id,
         "status": "COMPLETE",
@@ -197,8 +201,11 @@ def run_reliability_experiment(
         "primary_model_key": settings.primary_model_key,
         "architecture_search_closed": True,
         "best_checkpoint_count": checkpoint_count,
+        "resume_checkpoint_count": resume_count,
         "portable_checkpoint_count": portable_count,
         "prediction_file_count": prediction_count,
+        "calibration_file_count": calibration_count,
+        "metrics_file_count": metrics_count,
         "primary_drive": str(run_root),
         "secondary_backup": secondary,
         "reproducibility_pickle": str(reproducibility_path),
@@ -208,12 +215,16 @@ def run_reliability_experiment(
         "verification_passed": (
             len(metrics_rows) == expected_trials
             and checkpoint_count == expected_trials
+            and resume_count == expected_trials
             and portable_count == expected_trials
             and prediction_count == expected_trials
+            and calibration_count == expected_trials
+            and metrics_count == expected_trials
             and bool(secondary.get("verified"))
         ),
     }
     atomic_json(run_root / "FINAL_RELIABILITY_VERIFICATION.json", final)
+    atomic_json(run_root / "ARTIFACT_MANIFEST.json", _file_manifest(run_root))
     mirror_full_run(run_root, settings)
     if not final["verification_passed"]:
         raise RuntimeError(f"Final verification failed: {final}")
@@ -229,7 +240,9 @@ def regenerate_reliability_outputs(run_root: str | Path) -> dict[str, Any]:
     predictions = pd.read_csv(
         run_root / "predictions" / "all_oof_predictions.csv"
     )
-    trial_metrics = pd.read_csv(run_root / "tables" / "fold_seed_metrics.csv")
+    trial_metrics = pd.read_csv(
+        run_root / "tables" / "fold_seed_metrics.csv"
+    )
     robustness_path = (
         run_root / "robustness" / "all_robustness_predictions.csv"
     )
