@@ -274,6 +274,33 @@ def prepare_existing_v2_run(
                     pass
         shutil.rmtree(secondary_active, ignore_errors=True)
 
+    restart_cleanup: list[dict[str, Any]] = []
+    if not valid_primary:
+        for history in sorted(run.rglob("history.csv")):
+            trial = history.parent
+            if (trial / "COMPLETE.json").exists():
+                continue
+            for name in ("last_resume.pt", "best_model.pt"):
+                candidate = trial / name
+                if candidate.is_file():
+                    restart_cleanup.append(
+                        {
+                            "path": str(candidate),
+                            "bytes": int(candidate.stat().st_size),
+                            "sha256": sha256_file(candidate),
+                        }
+                    )
+                    candidate.unlink(missing_ok=True)
+            _atomic_json(
+                trial / "INTERRUPTED_TRIAL_RESTART.json",
+                {
+                    "reason": "No valid exact-resume checkpoint survived the failed Drive write.",
+                    "completed_trials_preserved": len(completed),
+                    "restart_scope": "this incomplete trial only",
+                    "updated_at_ns": time.time_ns(),
+                },
+            )
+
     report = {
         "policy_version": RESCUE_POLICY_VERSION,
         "run_id": run_id,
@@ -283,6 +310,12 @@ def prepare_existing_v2_run(
         "valid_incomplete_resumes": valid_primary,
         "invalid_resumes": invalid_primary,
         "restored_from_secondary": restored_from_secondary,
+        "resume_action": (
+            "resume_valid_incomplete_trial"
+            if valid_primary
+            else "restart_incomplete_trial_only"
+        ),
+        "restart_cleanup": restart_cleanup,
         "removed_temporary_files": removed,
         "removed_temporary_bytes": int(sum(x["bytes"] for x in removed)),
         "secondary_active_bytes_released": int(secondary_bytes_released),
@@ -293,11 +326,6 @@ def prepare_existing_v2_run(
     print(json.dumps(report, indent=2, default=str))
     if len(completed) < 1:
         raise RuntimeError("No completed V2 trials were found; refusing blind continuation.")
-    if not valid_primary:
-        raise RuntimeError(
-            "No valid incomplete V2 last_resume.pt was found. "
-            "Completed trials are safe, but the interrupted trial must restart."
-        )
     return report
 
 
