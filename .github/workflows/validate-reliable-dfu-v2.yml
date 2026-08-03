@@ -1,0 +1,25 @@
+name: Validate reliable DFU V2
+
+on:
+  push:
+    branches: [reliable-dfu-framework-v2]
+  pull_request:
+    paths:
+      - "src/reliable_*_v2.py"
+      - "tests/test_reliable_*_v2*.py"
+      - "notebooks/DFU_Reliable_Framework_V2_OneCell.ipynb"
+      - ".github/workflows/validate-reliable-dfu-v2.yml"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest numpy pandas scikit-learn Pillow
+      - name: Compile V2 source
+        run: python -m py_compile src/reliable_storage_v2.py src/reliable_runner_v2.py
+      - name: Run V2 safeguards
+        run: pytest -q tests/test_reliable_storage_v2.py tests/test_reliable_runner_v2_static.py
