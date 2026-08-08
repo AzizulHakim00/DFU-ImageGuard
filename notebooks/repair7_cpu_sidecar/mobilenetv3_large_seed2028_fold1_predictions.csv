@@ -1,0 +1,1 @@
+model_key,seed,outer_fold,image_id,group_id,label,label_name,relative_path,logit,prob_raw,prob_calibrated,pred,temperature,threshold
