@@ -1,0 +1,1 @@
+This directory is intentionally reserved for exact immutable Phase-2 source chunks. Files are committed through exact Git blob/tree operations; do not edit manually.
