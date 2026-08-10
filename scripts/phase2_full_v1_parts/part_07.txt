@@ -1,0 +1,91 @@
+.set_ylim(.90, 1.002); axins.grid(alpha=.2); axins.set_title("Zoom", fontsize=9)
+    save_figure(fig, png_dir, pdf_dir, "Fig03_ROC_with_Zoom")
+
+    # Fig04 PR + inset
+    fig, ax = plt.subplots(figsize=(8, 6.5)); axins = inset_axes(ax, width="45%", height="45%", loc="lower left", borderpad=2)
+    for m in EXPECTED_MODELS:
+        g = oof[oof["model_key"] == m]
+        pr, rc, _ = precision_recall_curve(g["label"], g["prob_calibrated"]); val = auc(rc, pr)
+        ax.plot(rc, pr, lw=2, label=f"{model_name(m)} (PR-AUC={val:.4f})"); axins.plot(rc, pr, lw=1.5)
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision"); ax.set_title("OOF Precision-Recall Curves", fontweight="bold"); ax.grid(alpha=.25); ax.legend(loc="lower left")
+    axins.set_xlim(.85, 1.0); axins.set_ylim(.90, 1.002); axins.grid(alpha=.2); axins.set_title("Zoom", fontsize=9)
+    save_figure(fig, png_dir, pdf_dir, "Fig04_PR_with_Zoom")
+
+    # Fig05 forest selected metrics
+    selected = pairwise[pairwise["metric"].isin(["balanced_accuracy","sensitivity","roc_auc","brier","ece"])].copy()
+    fig, ax = plt.subplots(figsize=(10, max(6, 0.35*len(selected))))
+    y = np.arange(len(selected)); delta = selected["observed_delta_a_minus_b"].to_numpy(float); lo = selected["ci95_lower"].to_numpy(float); hi = selected["ci95_upper"].to_numpy(float)
+    ax.errorbar(delta, y, xerr=[delta-lo, hi-delta], fmt="o", capsize=3)
+    labels2 = [f"{r.model_a} − {r.model_b} | {r.metric}" for r in selected.itertuples()]
+    ax.set_yticks(y); ax.set_yticklabels(labels2); ax.axvline(0, ls="--", lw=1); ax.invert_yaxis(); ax.set_xlabel("Metric difference (A − B), group-clustered 95% CI"); ax.set_title("Pairwise Model Comparison Forest Plot", fontweight="bold"); ax.grid(axis="x", alpha=.25)
+    save_figure(fig, png_dir, pdf_dir, "Fig05_Model_Comparison_Forest")
+
+    # Fig06 raw vs calibrated reliability, 3 panels
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), sharex=True, sharey=True)
+    for ax, m in zip(axes, EXPECTED_MODELS):
+        for ptype in ("raw","calibrated"):
+            c = reliability[(reliability["model_key"] == m) & (reliability["probability_type"] == ptype)]
+            ax.plot(c["mean_probability"], c["observed_rate"], marker="o", lw=1.7, label=ptype.title())
+        ax.plot([0,1],[0,1],ls="--",lw=1,label="Perfect"); ax.set_title(model_name(m)); ax.set_xlabel("Mean predicted probability"); ax.grid(alpha=.25)
+    axes[0].set_ylabel("Observed DFU rate"); axes[0].legend(); fig.suptitle("Raw vs Calibrated Reliability (Equal-Frequency Bins)", fontsize=14, fontweight="bold")
+    save_figure(fig, png_dir, pdf_dir, "Fig06_Raw_vs_Calibrated_Reliability")
+
+    # Fig07 calibration deltas
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+    for ax, raw_col, cal_col, title in [
+        (axes[0],"raw_brier_mean","calibrated_brier_mean","Brier Score"),
+        (axes[1],"raw_ece_mean","calibrated_ece_mean","ECE"),
+        (axes[2],"raw_log_loss_mean","calibrated_log_loss_mean","Log-loss")]:
+        x = np.arange(len(calibration_summary)); w=.34
+        ax.bar(x-w/2, calibration_summary[raw_col], width=w, label="Raw"); ax.bar(x+w/2, calibration_summary[cal_col], width=w, label="Calibrated")
+        ax.set_xticks(x); ax.set_xticklabels(calibration_summary["model_name"], rotation=20, ha="right"); ax.set_title(title); ax.grid(axis="y",alpha=.25)
+    axes[0].legend(); fig.suptitle("Effect of Temperature Scaling", fontsize=14, fontweight="bold")
+    save_figure(fig, png_dir, pdf_dir, "Fig07_Calibration_Improvement")
+
+    # Fig08 operating point
+    fig, ax = plt.subplots(figsize=(9, 6))
+    x = np.arange(len(threshold_summary)); w=.28
+    ax.bar(x-w/2, threshold_summary["sensitivity_mean"], width=w, label="Sensitivity"); ax.bar(x+w/2, threshold_summary["specificity_mean"], width=w, label="Specificity")
+    ax.axhline(TARGET_SENSITIVITY, ls="--", lw=1.4, label="Target sensitivity 0.95")
+    ax.set_xticks(x); ax.set_xticklabels(threshold_summary["model_name"]); ax.set_ylim(.85,1.01); ax.set_ylabel("Outer-test performance"); ax.set_title("Calibration-Selected Clinical Operating Point", fontweight="bold"); ax.grid(axis="y",alpha=.25); ax.legend()
+    save_figure(fig, png_dir, pdf_dir, "Fig08_Clinical_Operating_Point")
+
+    # Fig09 risk coverage
+    agg = selective.groupby(["model_key","model_name","coverage"], as_index=False).agg(error_rate=("accuracy", lambda s: 1-float(np.mean(s))))
+    fig, ax = plt.subplots(figsize=(8.5,6))
+    for m in EXPECTED_MODELS:
+        g=agg[agg.model_key==m].sort_values("coverage"); ax.plot(g.coverage,g.error_rate,marker="o",lw=2,label=model_name(m))
+    ax.set_xlabel("Coverage (fraction automatically classified)"); ax.set_ylabel("Error rate"); ax.set_title("Risk–Coverage Curves",fontweight="bold"); ax.grid(alpha=.25); ax.legend()
+    save_figure(fig,png_dir,pdf_dir,"Fig09_Risk_Coverage")
+
+    # Fig10 referral capture
+    agg2 = capture.groupby(["model_key","model_name","referral_rate"],as_index=False).agg(error_capture=("error_capture_fraction","mean"), fn_capture=("fn_capture_fraction","mean"))
+    fig, axes=plt.subplots(1,2,figsize=(13,5))
+    for m in EXPECTED_MODELS:
+        g=agg2[agg2.model_key==m].sort_values("referral_rate"); axes[0].plot(g.referral_rate,g.error_capture,marker="o",lw=2,label=model_name(m)); axes[1].plot(g.referral_rate,g.fn_capture,marker="o",lw=2,label=model_name(m))
+    axes[0].set_title("All-error capture"); axes[1].set_title("False-negative capture")
+    for ax in axes: ax.set_xlabel("Referral rate"); ax.set_ylabel("Fraction captured"); ax.grid(alpha=.25)
+    axes[0].legend(); fig.suptitle("How Much Error Is Removed by Referring Uncertain Cases?",fontsize=14,fontweight="bold")
+    save_figure(fig,png_dir,pdf_dir,"Fig10_Referral_Error_Capture")
+
+    # Fig11 stability
+    fig, axes=plt.subplots(1,2,figsize=(12,5))
+    axes[0].bar(stability_summary.model_name,stability_summary.prediction_agreement_fraction); axes[0].set_ylim(.8,1.01); axes[0].set_title("3-seed hard-prediction agreement"); axes[0].set_ylabel("Agreement fraction"); axes[0].grid(axis="y",alpha=.25)
+    axes[1].bar(stability_summary.model_name,stability_summary.mean_probability_sd_across_seeds); axes[1].set_title("Probability variability across seeds"); axes[1].set_ylabel("Mean probability SD"); axes[1].grid(axis="y",alpha=.25)
+    fig.suptitle("Stochastic Stability",fontsize=14,fontweight="bold"); save_figure(fig,png_dir,pdf_dir,"Fig11_Model_Stability")
+
+    # Fig12 duplicate group dist
+    counts=leakage_groups.groupby("n_images").size()
+    fig,ax=plt.subplots(figsize=(8,5.5)); ax.bar(counts.index.astype(str),counts.values); ax.set_xlabel("Images per similarity group"); ax.set_ylabel("Number of groups"); ax.set_title("Similarity-Group Size Distribution",fontweight="bold"); ax.grid(axis="y",alpha=.25)
+    save_figure(fig,png_dir,pdf_dir,"Fig12_Duplicate_Group_Distribution")
+
+    # Fig13 leakage comparison
+    actual=int(leakage_summary.iloc[0]["actual_cross_fold_group_leakage"]); mean_naive=float(leakage_sim["split_similarity_groups"].mean())
+    fig,axes=plt.subplots(1,2,figsize=(12,5))
+    axes[0].hist(leakage_sim["split_similarity_groups"],bins=25); axes[0].axvline(actual,ls="--",lw=2,label=f"Group-aware actual = {actual}"); axes[0].set_xlabel("Similarity groups split across folds"); axes[0].set_ylabel("Simulation count"); axes[0].set_title(f"Naive image-wise CV (mean={mean_naive:.1f})"); axes[0].legend()
+    axes[1].hist(leakage_sim["affected_image_fraction"]*100,bins=25); axes[1].axvline(0,ls="--",lw=2,label="Group-aware actual = 0%") ; axes[1].set_xlabel("Images affected by split groups (%)"); axes[1].set_ylabel("Simulation count"); axes[1].set_title("Potential similarity contamination"); axes[1].legend()
+    fig.suptitle(f"Naive Image-wise 5-fold CV vs Similarity-Group-Safe CV ({LEAKAGE_SIM_REPS:,} simulations)",fontsize=14,fontweight="bold")
+    save_figure(fig,png_dir,pdf_dir,"Fig13_Naive_vs_GroupSafe_Leakage")
+
+    # Fig14 hard cases
+    order=["easy_stable","occasional_instability","
