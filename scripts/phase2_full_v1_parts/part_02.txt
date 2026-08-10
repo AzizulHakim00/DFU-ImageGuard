@@ -1,0 +1,168 @@
+   row[f"{m}_mean"] = float(vals.mean())
+            row[f"{m}_sd"] = float(vals.std(ddof=1))
+            row[f"{m}_min"] = float(vals.min())
+            row[f"{m}_max"] = float(vals.max())
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def weighted_metric_dict(y: np.ndarray, p: np.ndarray, pred: np.ndarray, weights: np.ndarray) -> dict[str, float]:
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    y = np.asarray(y, dtype=int)
+    p = np.asarray(p, dtype=float)
+    pred = np.asarray(pred, dtype=int)
+    w = np.asarray(weights, dtype=float)
+    active = w > 0
+    y = y[active]; p = p[active]; pred = pred[active]; w = w[active]
+    if len(y) == 0 or np.sum(w) <= 0:
+        raise ValueError("weighted metric received no active rows")
+    tp = float(w[(y == 1) & (pred == 1)].sum())
+    tn = float(w[(y == 0) & (pred == 0)].sum())
+    fp = float(w[(y == 0) & (pred == 1)].sum())
+    fn = float(w[(y == 1) & (pred == 0)].sum())
+    n = float(w.sum())
+    accuracy = (tp + tn) / n
+    sensitivity = tp / max(tp + fn, 1e-12)
+    specificity = tn / max(tn + fp, 1e-12)
+    precision = tp / max(tp + fp, 1e-12)
+    f1 = 2 * precision * sensitivity / max(precision + sensitivity, 1e-12)
+    balanced = 0.5 * (sensitivity + specificity)
+    roc = float(roc_auc_score(y, p, sample_weight=w)) if len(np.unique(y)) == 2 else float("nan")
+    pr = float(average_precision_score(y, p, sample_weight=w)) if len(np.unique(y)) == 2 else float("nan")
+    brier = float(np.average((p - y) ** 2, weights=w))
+    pc = np.clip(p, 1e-7, 1 - 1e-7)
+    ll = float(np.average(-(y * np.log(pc) + (1 - y) * np.log(1 - pc)), weights=w))
+    ece = weighted_ece(y, p, w, bins=15)
+    return {
+        "accuracy": float(accuracy), "balanced_accuracy": float(balanced),
+        "sensitivity": float(sensitivity), "specificity": float(specificity),
+        "f1": float(f1), "roc_auc": roc, "pr_auc": pr,
+        "brier": brier, "log_loss": ll, "ece": float(ece),
+    }
+
+
+def weighted_ece(y: np.ndarray, p: np.ndarray, w: np.ndarray, bins: int = 15) -> float:
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    total = float(w.sum())
+    out = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (p >= lo) & ((p < hi) if hi < 1 else (p <= hi))
+        if not mask.any():
+            continue
+        wb = w[mask]
+        mass = float(wb.sum())
+        if mass <= 0:
+            continue
+        obs = float(np.average(y[mask], weights=wb))
+        conf = float(np.average(p[mask], weights=wb))
+        out += (mass / total) * abs(obs - conf)
+    return float(out)
+
+
+def group_cluster_bootstrap(oof: pd.DataFrame, reps: int = BOOTSTRAP_REPS, seed: int = RNG_SEED) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    metrics_to_report = ["accuracy", "balanced_accuracy", "sensitivity", "specificity", "f1", "roc_auc", "pr_auc", "brier", "log_loss", "ece"]
+    groups = sorted(oof["group_id"].astype(str).unique().tolist())
+    group_to_int = {gid: i for i, gid in enumerate(groups)}
+    arrays: dict[str, dict[str, np.ndarray]] = {}
+    observed: dict[str, dict[str, float]] = {}
+    for m in EXPECTED_MODELS:
+        g = oof.loc[oof["model_key"] == m].reset_index(drop=True)
+        arrays[m] = {
+            "y": g["label"].to_numpy(int),
+            "p": g["prob_calibrated"].to_numpy(float),
+            "pred": g["pred"].to_numpy(int),
+            "group_index": g["group_id"].astype(str).map(group_to_int).to_numpy(int),
+        }
+        observed[m] = metric_dict(arrays[m]["y"], arrays[m]["p"], arrays[m]["pred"])
+
+    rng = np.random.default_rng(seed)
+    boot = {m: {metric: np.empty(int(reps), dtype=float) for metric in metrics_to_report} for m in EXPECTED_MODELS}
+    pairs = [(EXPECTED_MODELS[i], EXPECTED_MODELS[j]) for i in range(len(EXPECTED_MODELS)) for j in range(i + 1, len(EXPECTED_MODELS))]
+    delta_store = {pair: {metric: np.empty(int(reps), dtype=float) for metric in metrics_to_report} for pair in pairs}
+    valid = 0
+    for rep in range(int(reps)):
+        sampled_int = rng.integers(0, len(groups), size=len(groups))
+        cluster_counts = np.bincount(sampled_int, minlength=len(groups)).astype(float)
+        rep_metrics: dict[str, dict[str, float]] = {}
+        invalid = False
+        for m in EXPECTED_MODELS:
+            a = arrays[m]
+            row_weights = cluster_counts[a["group_index"]]
+            active_labels = np.unique(a["y"][row_weights > 0])
+            if len(active_labels) != 2:
+                invalid = True
+                break
+            rep_metrics[m] = weighted_metric_dict(a["y"], a["p"], a["pred"], row_weights)
+        if invalid:
+            continue
+        for m in EXPECTED_MODELS:
+            for metric in metrics_to_report:
+                boot[m][metric][valid] = rep_metrics[m][metric]
+        for a, b in pairs:
+            for metric in metrics_to_report:
+                delta_store[(a, b)][metric][valid] = rep_metrics[a][metric] - rep_metrics[b][metric]
+        valid += 1
+
+    if valid < max(100, int(reps * 0.9)):
+        raise RuntimeError(f"Too few valid group bootstrap replicates: {valid}/{reps}")
+
+    ci_rows = []
+    for m in EXPECTED_MODELS:
+        for metric in metrics_to_report:
+            arr = boot[m][metric][:valid]
+            lo, hi = np.quantile(arr, [0.025, 0.975])
+            ci_rows.append({
+                "model_key": m, "model_name": model_name(m), "metric": metric,
+                "observed": float(observed[m][metric]), "ci95_lower": float(lo), "ci95_upper": float(hi),
+                "bootstrap_reps": int(valid), "cluster_unit": "group_id",
+                "repeated_seed_rows_preserved_within_cluster": True,
+            })
+    ci_df = pd.DataFrame(ci_rows)
+
+    pair_rows = []
+    for (a, b), metrics in delta_store.items():
+        for metric, values in metrics.items():
+            arr = values[:valid]
+            lo, hi = np.quantile(arr, [0.025, 0.975])
+            obs_delta = float(observed[a][metric] - observed[b][metric])
+            p_two = float(min(1.0, 2.0 * min(np.mean(arr <= 0), np.mean(arr >= 0))))
+            pair_rows.append({
+                "model_a": model_name(a), "model_a_key": a, "model_b": model_name(b), "model_b_key": b,
+                "metric": metric, "observed_delta_a_minus_b": obs_delta,
+                "ci95_lower": float(lo), "ci95_upper": float(hi), "bootstrap_p_two_sided": p_two,
+                "significant_ci_excludes_zero": bool(not (lo <= 0 <= hi)),
+                "bootstrap_reps": int(valid), "cluster_unit": "group_id",
+            })
+    pair_df = pd.DataFrame(pair_rows)
+    pair_df["holm_p"] = np.nan
+    for metric, idx in pair_df.groupby("metric").groups.items():
+        ids = list(idx)
+        pvals = pair_df.loc[ids, "bootstrap_p_two_sided"].to_numpy(float)
+        order = np.argsort(pvals)
+        adjusted = np.empty_like(pvals)
+        running = 0.0
+        mtests = len(pvals)
+        for rank, pos in enumerate(order):
+            val = min(1.0, (mtests - rank) * pvals[pos])
+            running = max(running, val)
+            adjusted[pos] = running
+        pair_df.loc[ids, "holm_p"] = adjusted
+    pair_df["significant_holm_0_05"] = pair_df["holm_p"] < 0.05
+    higher_better = {"accuracy", "balanced_accuracy", "sensitivity", "specificity", "f1", "roc_auc", "pr_auc"}
+    def favored(row):
+        if not row["significant_holm_0_05"]:
+            return "No clear difference"
+        delta = float(row["observed_delta_a_minus_b"])
+        if row["metric"] in higher_better:
+            return row["model_a"] if delta > 0 else row["model_b"]
+        return row["model_a"] if delta < 0 else row["model_b"]
+    pair_df["favored_model"] = pair_df.apply(favored, axis=1)
+    meta = {
+        "valid_bootstrap_reps": int(valid), "requested_reps": int(reps), "n_groups": len(groups), "seed": seed,
+        "implementation": "cluster_count_weighted_bootstrap",
+    }
+    return ci_df, pair_df, meta
+
+
+def calibration_intercept_slope(y: np.ndarray, p: np.ndarray) -> tuple[float, float]:
+    from 
