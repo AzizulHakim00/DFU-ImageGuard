@@ -1,0 +1,153 @@
+):
+                matches = list(dataset_root.rglob(Path(rel).name))
+                image_path = matches[0] if matches else image_path
+            record = {
+                "model_key": m, "model_name": model_name(m), "checkpoint_seed": int(ck["seed"]), "checkpoint_fold": int(ck["outer_fold"]),
+                "case_type": str(case["case_type"]), "image_id": str(case["image_id"]), "relative_path": rel,
+                "image_found": image_path.is_file(), "gradcam_status": "NOT_RUN", "lime_status": "NOT_RUN", "shap_status": "NOT_RUN",
+                "probability": None, "error": "",
+            }
+            if not image_path.is_file():
+                record["error"] = "image not found"
+                xai_rows.append(record)
+                continue
+            try:
+                image, tensor = prepare_image_tensor(image_path)
+                cam, prob = gradcam_map(model, m, tensor, device)
+                record["probability"] = prob
+                record["gradcam_status"] = "PASS"
+            except Exception as exc:
+                image = None
+                cam = None
+                record["gradcam_status"] = "FAIL"
+                record["error"] += f"GradCAM {type(exc).__name__}: {exc}; "
+            lime_img = None
+            shap_heat = None
+            if image is not None:
+                try:
+                    lime_img = lime_map(model, tensor, image, device)
+                    record["lime_status"] = "PASS"
+                except Exception as exc:
+                    record["lime_status"] = "FAIL"
+                    record["error"] += f"LIME {type(exc).__name__}: {exc}; "
+                try:
+                    shap_heat = shap_map(model, tensor, device)
+                    record["shap_status"] = "PASS"
+                except Exception as exc:
+                    record["shap_status"] = "FAIL"
+                    record["error"] += f"SHAP {type(exc).__name__}: {exc}; "
+            xai_rows.append(record)
+
+            if image is not None:
+                fig, axes = plt.subplots(1, 4, figsize=(15, 4))
+                axes[0].imshow(image.resize((224, 224)))
+                axes[0].set_title(f"Original\n{case['case_type']}")
+                axes[0].axis("off")
+                if cam is not None:
+                    axes[1].imshow(image.resize((224, 224)))
+                    axes[1].imshow(cam, alpha=0.45, cmap="jet")
+                    axes[1].set_title(f"Grad-CAM\np(DFU)={prob:.3f}")
+                else:
+                    axes[1].text(0.5, 0.5, "Grad-CAM unavailable", ha="center", va="center")
+                axes[1].axis("off")
+                if lime_img is not None:
+                    axes[2].imshow(lime_img)
+                    axes[2].set_title("LIME")
+                else:
+                    axes[2].text(0.5, 0.5, "LIME unavailable", ha="center", va="center")
+                axes[2].axis("off")
+                if shap_heat is not None:
+                    axes[3].imshow(image.resize((224, 224)))
+                    axes[3].imshow(shap_heat, alpha=0.45, cmap="magma")
+                    axes[3].set_title("SHAP")
+                else:
+                    axes[3].text(0.5, 0.5, "SHAP unavailable", ha="center", va="center")
+                axes[3].axis("off")
+                fig.suptitle(f"{model_name(m)} — {case['case_type']}", fontsize=13, fontweight="bold")
+                save_figure(fig, png_dir, pdf_dir, f"XAI_{m}_{case['case_type']}")
+        del model, payload
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    xai_df = pd.DataFrame(xai_rows)
+    return xai_df, {
+        "status": "PASS_WITH_CONDITIONAL_METHOD_STATUS" if not xai_df.empty else "SKIPPED",
+        "representative_models": [model_name(m) for m in selected_models],
+        "cases_requested": list(XAI_CASE_TYPES),
+        "training_performed": False,
+        "parameter_updates": False,
+        "gradients_used_only_for_attribution": True,
+    }
+
+
+def make_figures(
+    primary: pd.DataFrame,
+    ci: pd.DataFrame,
+    pairwise: pd.DataFrame,
+    oof: pd.DataFrame,
+    calibration_summary: pd.DataFrame,
+    reliability: pd.DataFrame,
+    threshold_trials: pd.DataFrame,
+    threshold_summary: pd.DataFrame,
+    selective: pd.DataFrame,
+    capture: pd.DataFrame,
+    leakage_summary: pd.DataFrame,
+    leakage_groups: pd.DataFrame,
+    leakage_sim: pd.DataFrame,
+    hard_cases: pd.DataFrame,
+    agreement_pairs: pd.DataFrame,
+    stability_summary: pd.DataFrame,
+    dca: pd.DataFrame,
+    png_dir: Path,
+    pdf_dir: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+    from sklearn.metrics import roc_curve, precision_recall_curve, auc
+
+    # Fig01 architecture
+    fig, ax = plt.subplots(figsize=(13, 7))
+    ax.set_xlim(0, 13); ax.set_ylim(0, 7); ax.axis("off")
+    boxes = [
+        (0.4, 5.1, 2.1, 1.0, "Frozen Primary Run\n45 trials / 9,495 OOF"),
+        (3.1, 5.1, 2.1, 1.0, "Integrity Gate\nfolds • groups • hashes"),
+        (5.8, 5.1, 2.1, 1.0, "Primary Results\nmetrics • CI • statistics"),
+        (8.5, 5.1, 2.1, 1.0, "Calibration +\nClinical Threshold"),
+        (11.2, 5.1, 1.4, 1.0, "Referral\nAnalysis"),
+        (1.2, 2.6, 2.2, 1.0, "Similarity / Leakage\n1,000 naive split simulations"),
+        (4.2, 2.6, 2.2, 1.0, "Group-Clustered\nBootstrap + Holm"),
+        (7.2, 2.6, 2.2, 1.0, "Stability +\nHard Cases"),
+        (10.2, 2.6, 2.2, 1.0, "Checkpoint Audit\nConditional XAI"),
+        (5.0, 0.45, 3.0, 1.0, "PHASE2_FULL_FINAL_EXPORT\nTables • PNG/PDF • PKL • Manifest"),
+    ]
+    for x, y, w, h, txt in boxes:
+        p = FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.03,rounding_size=0.08", linewidth=1.4, facecolor="white", edgecolor="black")
+        ax.add_patch(p); ax.text(x+w/2, y+h/2, txt, ha="center", va="center", fontsize=10)
+    arrows = [((2.5,5.6),(3.1,5.6)),((5.2,5.6),(5.8,5.6)),((7.9,5.6),(8.5,5.6)),((10.6,5.6),(11.2,5.6)),
+              ((4.2,5.1),(2.3,3.6)),((6.8,5.1),(5.3,3.6)),((9.4,5.1),(8.3,3.6)),((11.9,5.1),(11.3,3.6)),
+              ((2.3,2.6),(6.0,1.45)),((5.3,2.6),(6.2,1.45)),((8.3,2.6),(6.5,1.45)),((11.3,2.6),(7.0,1.45))]
+    for a,b in arrows:
+        ax.add_patch(FancyArrowPatch(a,b,arrowstyle="->",mutation_scale=12,linewidth=1.2))
+    ax.set_title("DFU-ImageGuard Phase-2 Trustworthiness Analysis Architecture", fontsize=15, fontweight="bold")
+    save_figure(fig, png_dir, pdf_dir, "Fig01_Evaluation_Architecture")
+
+    # Fig02 performance overview
+    metrics = ["accuracy_mean", "balanced_accuracy_mean", "sensitivity_mean", "specificity_mean", "f1_mean"]
+    labels = ["Accuracy", "Balanced Acc.", "Sensitivity", "Specificity", "F1"]
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x = np.arange(len(labels)); width = 0.24
+    for i, (_, r) in enumerate(primary.iterrows()):
+        vals = [r[m] for m in metrics]
+        ax.bar(x + (i-1)*width, vals, width=width, label=r["model_name"])
+    ax.set_xticks(x); ax.set_xticklabels(labels); ax.set_ylim(0.90, 1.01); ax.set_ylabel("Mean over 15 fold-seed trials")
+    ax.set_title("Primary Classification Performance", fontweight="bold"); ax.grid(axis="y", alpha=0.25); ax.legend(ncol=3, loc="lower center")
+    save_figure(fig, png_dir, pdf_dir, "Fig02_Performance_Overview")
+
+    # Fig03 ROC + inset
+    fig, ax = plt.subplots(figsize=(8, 6.5)); axins = inset_axes(ax, width="45%", height="45%", loc="lower right", borderpad=2)
+    for m in EXPECTED_MODELS:
+        g = oof[oof["model_key"] == m]
+        fpr, tpr, _ = roc_curve(g["label"], g["prob_calibrated"]); roc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, lw=2, label=f"{model_name(m)} (AUC={roc:.4f})"); axins.plot(fpr, tpr, lw=1.5)
+    ax.plot([0,1],[0,1],ls="--",lw=1); ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate"); ax.set_title("OOF ROC Curves", fontweight="bold"); ax.grid(alpha=.25); ax.legend(loc="lower right")
+    axins.set_xlim(0, .10); axins
