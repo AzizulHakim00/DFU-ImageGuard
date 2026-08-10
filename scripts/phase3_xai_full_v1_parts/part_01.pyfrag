@@ -1,0 +1,220 @@
+from __future__ import annotations
+
+import hashlib, io, json, math, os, pickle, random, shutil, subprocess, sys, time, zipfile
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+VERSION = "DFU_PHASE3_XAI_FULL_V1_20260811"
+RUN_ID = "RELIABLE_DFU_CV_V3_MISSING38"
+DRIVE_ROOT = Path("/content/drive/MyDrive/DFU-ImageGuard")
+RUN_ROOT = DRIVE_ROOT / "runs" / RUN_ID
+PHASE2_ROOT = RUN_ROOT / "PHASE2_FULL"
+OUT_ROOT = RUN_ROOT / "PHASE3_XAI_FULL"
+RNG_SEED = 2026
+IMAGE_SIZE = 224
+MODEL_NAMES = {
+    "convnextv2_tiny": "ConvNeXtV2-Tiny",
+    "densenet121": "DenseNet121",
+    "mobilenetv3_large": "MobileNetV3-Large",
+}
+MODEL_CANDIDATES = {
+    "convnextv2_tiny": (
+        "convnextv2_tiny.fcmae_ft_in22k_in1k",
+        "convnextv2_tiny.fcmae_ft_in1k",
+        "convnextv2_tiny.fcmae",
+    ),
+    "densenet121": ("densenet121.ra_in1k", "densenet121"),
+    "mobilenetv3_large": ("mobilenetv3_large_100.ra_in1k", "mobilenetv3_large_100"),
+}
+FAST_CAM_METHODS = ("GradCAM", "GradCAM++", "HiResCAM", "LayerCAM")
+SLOW_CAM_METHODS = ("ScoreCAM", "AblationCAM")
+INPUT_METHODS = ("IntegratedGradients", "SmoothGrad", "GradientSHAP", "Occlusion", "LIME", "SHAP", "RISE")
+ALL_METHODS = FAST_CAM_METHODS + SLOW_CAM_METHODS + INPUT_METHODS
+CASE_TYPES = (
+    "confident_true_positive", "confident_true_negative",
+    "representative_false_negative", "representative_false_positive",
+    "uncertain_dfu", "uncertain_normal",
+)
+
+
+def sha256_file(path: Path, chunk=8 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def atomic_csv(path: Path, df: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def atomic_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def ensure_packages() -> None:
+    import importlib.util
+    pkgs = {
+        "timm": "timm>=1.0.15",
+        "pytorch_grad_cam": "grad-cam>=1.5.4",
+        "captum": "captum>=0.7.0",
+        "lime": "lime>=0.2.0.1",
+        "shap": "shap>=0.46.0",
+        "skimage": "scikit-image>=0.22.0",
+        "kagglehub": "kagglehub>=0.3.0",
+    }
+    missing = [pip for mod,pip in pkgs.items() if importlib.util.find_spec(mod) is None]
+    if missing:
+        print("Installing XAI-only dependencies:", ", ".join(missing))
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
+
+
+def mount_drive() -> None:
+    if Path("/content/drive/MyDrive").is_dir():
+        return
+    from google.colab import drive
+    drive.mount("/content/drive", force_remount=False)
+
+
+def configure_plotting() -> None:
+    import matplotlib as mpl
+    mpl.rcParams.update({
+        "figure.dpi": 120, "savefig.dpi": 400,
+        "font.size": 11, "axes.titlesize": 13, "axes.labelsize": 11,
+        "legend.fontsize": 9, "xtick.labelsize": 9, "ytick.labelsize": 9,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "pdf.fonttype": 42, "ps.fonttype": 42,
+    })
+
+
+def save_fig(fig, stem: str) -> None:
+    png = OUT_ROOT / "figures_png" / f"{stem}.png"
+    pdf = OUT_ROOT / "figures_pdf" / f"{stem}.pdf"
+    png.parent.mkdir(parents=True, exist_ok=True); pdf.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, bbox_inches="tight", dpi=400)
+    fig.savefig(pdf, bbox_inches="tight")
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def tree_signature(root: Path) -> dict[str, tuple[int,str]]:
+    sig = {}
+    if not root.exists():
+        return sig
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            rel = str(p.relative_to(root))
+            # full SHA for scientifically relevant trial files; metadata only for others
+            if p.name in {"COMPLETE.json", "test_predictions.csv", "best_model_portable_fp16.pt", "TRIAL_VERIFICATION.json"}:
+                sig[rel] = (int(p.stat().st_size), sha256_file(p))
+            else:
+                sig[rel] = (int(p.stat().st_size), "")
+    return sig
+
+
+def load_inputs():
+    ver_path = PHASE2_ROOT / "PHASE2_FULL_VERIFICATION.json"
+    if not ver_path.exists():
+        raise FileNotFoundError(f"Phase-2 verification not found: {ver_path}")
+    ver = json.loads(ver_path.read_text(encoding="utf-8"))
+    if ver.get("status") != "PASS":
+        raise RuntimeError("Phase-2 verification is not PASS")
+    if bool(ver.get("primary_training_performed", False)) or bool(ver.get("primary_trials_modified", False)):
+        raise RuntimeError("Phase-2 safety status is not read-only")
+
+    inv = pd.read_csv(PHASE2_ROOT / "tables" / "14_checkpoint_inventory.csv")
+    usable = inv.loc[(inv["exists"] == True) & (inv["metadata_valid"] == True)].copy()
+    if len(usable) != 7:
+        raise RuntimeError(f"Expected exactly 7 verified checkpoints; found {len(usable)}")
+    for _,r in usable.iterrows():
+        p=Path(r["path"])
+        if not p.exists(): raise FileNotFoundError(p)
+        if sha256_file(p) != str(r["sha256"]): raise RuntimeError(f"Checkpoint SHA mismatch: {p}")
+
+    oof_path = RUN_ROOT / "tables" / "all_oof_predictions.csv"
+    met_path = RUN_ROOT / "tables" / "fold_seed_metrics.csv"
+    if not oof_path.exists() or not met_path.exists():
+        raise FileNotFoundError("Primary OOF/metrics tables missing from frozen run root")
+    oof = pd.read_csv(oof_path)
+    metrics = pd.read_csv(met_path)
+    hard = pd.read_csv(PHASE2_ROOT / "tables" / "11_hard_case_consistency.csv")
+    return ver, usable, oof, metrics, hard
+
+
+def locate_dataset_root() -> Path:
+    # Prefer path encoded by existing files; otherwise use Kaggle cache/download.
+    import kagglehub
+    root = Path(kagglehub.dataset_download("laithjj/diabetic-foot-ulcer-dfu"))
+    if not root.exists(): raise FileNotFoundError(root)
+    return root
+
+
+def resolve_image_path(root: Path, relative_path: str) -> Path:
+    rel = Path(str(relative_path))
+    direct = root / rel
+    if direct.exists(): return direct
+    # suffix match, safe against same basename ambiguity
+    parts = rel.parts
+    cands=[]
+    for p in root.rglob(rel.name):
+        if not p.is_file(): continue
+        pp=p.parts
+        if len(pp)>=len(parts) and tuple(pp[-len(parts):]) == tuple(parts): cands.append(p)
+    if len(cands)==1: return cands[0]
+    if not cands:
+        # last resort basename if unique
+        cands=[p for p in root.rglob(rel.name) if p.is_file()]
+    if len(cands)!=1:
+        raise RuntimeError(f"Could not uniquely resolve image {relative_path}; candidates={len(cands)}")
+    return cands[0]
+
+
+def build_base_model(model_key: str):
+    import timm
+    errors=[]
+    for name in MODEL_CANDIDATES[model_key]:
+        try:
+            m=timm.create_model(name, pretrained=False, num_classes=1, drop_rate=0.20)
+            return m,name
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}: {e}")
+    raise RuntimeError(" | ".join(errors))
+
+
+def load_checkpoint_model(model_key: str, checkpoint: Path, device):
+    import torch
+    model, arch = build_base_model(model_key)
+    payload=torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state=payload.get("state_dict") or payload.get("model")
+    if state is None: raise RuntimeError(f"No state_dict in {checkpoint}")
+    state={k:v.float() if torch.is_floating_point(v) else v for k,v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f"Checkpoint/model mismatch {model_key}: missing={missing[:5]} unexpected={unexpected[:5]}")
+    model.eval().to(device)
+    return model, arch, payload
+
+
+def target_layer(model_key: str, model):
+    if model_key == "convnextv2_tiny": return model.stages[-1]
+    if model_key == "densenet121":
+        try: return model.features.norm5
+        except Exception: return model.features
+    if model_key == "mobilenetv3_large": return model.blocks[-1]
+    raise ValueError(model_key)
+
+
+def image_transform():
+    from torchvision import transforms
+    return transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
