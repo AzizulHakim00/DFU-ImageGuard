@@ -1,0 +1,220 @@
+        mask=mask.reshape(1,1,patches,patches)
+        mask=F.interpolate(mask,size=(IMAGE_SIZE,IMAGE_SIZE),mode="nearest")
+        deleted=x*(1-mask)+baseline*mask
+        inserted=baseline*(1-mask)+x*mask
+        dels.append(target_probability_from_base(base_model,deleted,target_class))
+        ins.append(target_probability_from_base(base_model,inserted,target_class))
+        fracs.append(k/steps)
+    deletion_auc=float(np.trapz(dels,fracs)); insertion_auc=float(np.trapz(ins,fracs))
+    # top20 confidence drop
+    idx=int(round(steps*0.2)); drop=float(orig-dels[idx])
+    return {"deletion_auc":deletion_auc,"insertion_auc":insertion_auc,"top20_confidence_drop":drop,"curve_fraction":fracs,"deletion_curve":dels,"insertion_curve":ins}
+
+
+def map_entropy_and_concentration(sal):
+    a=np.abs(np.asarray(sal,float)); flat=a.flatten(); s=flat.sum()+1e-12; q=flat/s
+    entropy=float(-(q*np.log(q+1e-12)).sum()/np.log(len(q)))
+    k=max(1,int(0.10*len(flat))); concentration=float(np.sort(flat)[-k:].sum()/s)
+    return entropy,concentration
+
+
+def map_corr(a,b):
+    from scipy.stats import spearmanr
+    aa=np.abs(np.asarray(a)).ravel(); bb=np.abs(np.asarray(b)).ravel()
+    if np.std(aa)<1e-10 or np.std(bb)<1e-10: return np.nan
+    return float(spearmanr(aa,bb).correlation)
+
+
+def overlay_heat(rgb, sal, signed=False):
+    import matplotlib.cm as cm
+    if signed:
+        a=np.asarray(sal,float); a=(a+1)/2
+        heat=cm.get_cmap("coolwarm")(np.clip(a,0,1))[...,:3]
+        alpha=np.minimum(0.72,np.abs(np.asarray(sal))[...,None]*0.72)
+    else:
+        heat=cm.get_cmap("turbo")(np.clip(sal,0,1))[...,:3]
+        alpha=(np.clip(sal,0,1)[...,None]*0.72)
+    return np.clip(rgb*(1-alpha)+heat*alpha,0,1)
+
+
+def make_case_panels(case_meta: pd.DataFrame, map_index: dict, image_cache: dict):
+    import matplotlib.pyplot as plt
+    cam_methods=list(FAST_CAM_METHODS+SLOW_CAM_METHODS)
+    attr_methods=list(INPUT_METHODS)
+    for model_key,gg in case_meta.groupby("model_key",sort=False):
+        g=gg.set_index("case_type").reindex([c for c in CASE_TYPES if c in set(gg.case_type)]).reset_index()
+        for family,methods in [("CAM_Family",cam_methods),("Attribution_Family",attr_methods)]:
+            fig,axes=plt.subplots(len(g),len(methods)+1,figsize=(2.7*(len(methods)+1),2.45*len(g)),squeeze=False)
+            for i,r in g.iterrows():
+                key=(model_key,r.case_type,str(r.image_id),int(r.checkpoint_seed),int(r.checkpoint_fold))
+                rgb=image_cache[key]["rgb"]
+                axes[i,0].imshow(rgb); axes[i,0].axis("off")
+                axes[i,0].set_title("Original" if i==0 else "",fontsize=10)
+                axes[i,0].set_ylabel(r.case_type.replace("_","\n"),fontsize=9)
+                for j,m in enumerate(methods,1):
+                    entry=map_index.get((key,m))
+                    ax=axes[i,j]; ax.axis("off")
+                    if entry is None or entry.get("status")!="PASS":
+                        ax.text(.5,.5,"Unavailable",ha="center",va="center",transform=ax.transAxes); continue
+                    ov=overlay_heat(rgb,entry["map"],signed=entry["signed"])
+                    ax.imshow(ov)
+                    if i==0: ax.set_title(m,fontsize=10)
+                # metadata under first column title line
+                axes[i,0].text(0,-.08,f"y={r.label}, pred={r.pred}, pcal={r.prob_calibrated:.3f}, τ={r.threshold:.3f}\nseed={r.checkpoint_seed}, fold={r.checkpoint_fold}",
+                               transform=axes[i,0].transAxes,fontsize=7,va="top")
+            fig.suptitle(f"{MODEL_NAMES[model_key]} — {family.replace('_',' ')}",fontsize=16,fontweight="bold")
+            fig.subplots_adjust(top=.96,hspace=.35,wspace=.05)
+            save_fig(fig,f"FigX_{model_key}_{family}")
+
+
+def plot_quantitative(method_summary: pd.DataFrame, agreement: pd.DataFrame, sanity: pd.DataFrame, curve_df: pd.DataFrame):
+    import matplotlib.pyplot as plt
+    # Faithfulness leaderboard
+    s=method_summary.sort_values(["deletion_auc_mean","insertion_auc_mean"],ascending=[True,False])
+    fig,ax=plt.subplots(figsize=(10,6)); x=np.arange(len(s)); w=.36
+    ax.bar(x-w/2,s.deletion_auc_mean,width=w,label="Deletion AUC ↓")
+    ax.bar(x+w/2,s.insertion_auc_mean,width=w,label="Insertion AUC ↑")
+    ax.set_xticks(x); ax.set_xticklabels(s.method,rotation=45,ha="right"); ax.set_ylabel("AUC"); ax.set_title("XAI Faithfulness: Deletion and Insertion"); ax.legend(); ax.grid(axis="y",alpha=.25)
+    save_fig(fig,"FigX_Faithfulness_Leaderboard")
+
+    fig,ax=plt.subplots(figsize=(10,5)); s2=method_summary.sort_values("top20_confidence_drop_mean",ascending=False)
+    ax.bar(s2.method,s2.top20_confidence_drop_mean); ax.set_xticklabels(s2.method,rotation=45,ha="right"); ax.set_ylabel("Target-score drop"); ax.set_title("Top-20% Attribution Removal: Confidence Drop"); ax.grid(axis="y",alpha=.25)
+    save_fig(fig,"FigX_Top20_Confidence_Drop")
+
+    fig,ax=plt.subplots(figsize=(10,5)); s3=method_summary.sort_values("entropy_mean")
+    ax.bar(s3.method,s3.entropy_mean); ax.set_xticklabels(s3.method,rotation=45,ha="right"); ax.set_ylabel("Normalized attribution entropy ↓"); ax.set_title("Explanation Compactness / Sparsity"); ax.grid(axis="y",alpha=.25)
+    save_fig(fig,"FigX_Explanation_Compactness")
+
+    # Agreement heatmap
+    if not agreement.empty:
+        piv=agreement.pivot(index="method_a",columns="method_b",values="mean_spearman").copy()
+        methods=sorted(set(agreement.method_a)|set(agreement.method_b)); mat=pd.DataFrame(np.eye(len(methods)),index=methods,columns=methods)
+        for _,r in agreement.iterrows(): mat.loc[r.method_a,r.method_b]=r.mean_spearman; mat.loc[r.method_b,r.method_a]=r.mean_spearman
+        fig,ax=plt.subplots(figsize=(10,8)); im=ax.imshow(mat.values,vmin=-1,vmax=1,cmap="coolwarm"); ax.set_xticks(range(len(methods))); ax.set_yticks(range(len(methods))); ax.set_xticklabels(methods,rotation=45,ha="right"); ax.set_yticklabels(methods); ax.set_title("Cross-Method Attribution Agreement (Spearman)"); fig.colorbar(im,ax=ax,label="Mean Spearman ρ")
+        save_fig(fig,"FigX_Method_Agreement")
+
+    if not sanity.empty:
+        ss=sanity.groupby("method",as_index=False).saliency_spearman_after_head_randomization.mean().sort_values("saliency_spearman_after_head_randomization")
+        fig,ax=plt.subplots(figsize=(8,5)); ax.bar(ss.method,ss.saliency_spearman_after_head_randomization); ax.axhline(.5,ls="--",lw=1); ax.set_ylabel("Original vs randomized-head saliency ρ ↓"); ax.set_title("Parameter-Randomization Sanity Check"); ax.set_xticklabels(ss.method,rotation=30,ha="right"); ax.grid(axis="y",alpha=.25)
+        save_fig(fig,"FigX_Parameter_Randomization_Sanity")
+
+    if not curve_df.empty:
+        # average deletion/insertion curves
+        fig,axes=plt.subplots(1,2,figsize=(12,5))
+        for method,g in curve_df.groupby("method"):
+            d=g.groupby("fraction").deletion_score.mean(); ins=g.groupby("fraction").insertion_score.mean()
+            axes[0].plot(d.index,d.values,label=method); axes[1].plot(ins.index,ins.values,label=method)
+        axes[0].set_title("Deletion Curves"); axes[0].set_xlabel("Top attribution fraction removed"); axes[0].set_ylabel("Target score")
+        axes[1].set_title("Insertion Curves"); axes[1].set_xlabel("Top attribution fraction inserted"); axes[1].set_ylabel("Target score")
+        for ax in axes: ax.grid(alpha=.25)
+        axes[1].legend(bbox_to_anchor=(1.02,1),loc="upper left",fontsize=8)
+        save_fig(fig,"FigX_Deletion_Insertion_Curves")
+
+
+def controlled_response_curves(oof, usable, dataset_root, device):
+    from PIL import Image, ImageEnhance, ImageFilter
+    import torch
+    rows=[]
+    # common seed2026/fold1 is verified for all three models
+    for model_key in MODEL_NAMES:
+        t=usable[(usable.model_key==model_key)&(usable.seed==2026)&(usable.outer_fold==1)]
+        if t.empty: continue
+        t=t.iloc[0]; model,_,_=load_checkpoint_model(model_key,Path(t.path),device)
+        g=oof[(oof.model_key==model_key)&(oof.seed==2026)&(oof.outer_fold==1)].sort_values("image_id")
+        # deterministic balanced subset, up to 12 images
+        sel=pd.concat([g[g.label==0].head(6),g[g.label==1].head(6)],ignore_index=True)
+        levels={
+            "brightness":[0.6,0.8,1.0,1.2,1.4],
+            "contrast":[0.6,0.8,1.0,1.2,1.4],
+            "blur_sigma":[0.0,0.5,1.0,1.5,2.0],
+            "rotation_deg":[-15,-7,0,7,15],
+        }
+        tf=image_transform()
+        for _,r in sel.iterrows():
+            path=resolve_image_path(dataset_root,r.relative_path); base=Image.open(path).convert("RGB")
+            for factor,vals in levels.items():
+                for val in vals:
+                    if factor=="brightness": im=ImageEnhance.Brightness(base).enhance(val)
+                    elif factor=="contrast": im=ImageEnhance.Contrast(base).enhance(val)
+                    elif factor=="blur_sigma": im=base.filter(ImageFilter.GaussianBlur(radius=val))
+                    else: im=base.rotate(val,resample=Image.BILINEAR)
+                    x=tf(im).unsqueeze(0).to(device)
+                    with torch.no_grad(): p=float(torch.sigmoid(model(x).reshape(-1))[0].cpu())
+                    rows.append({"model_key":model_key,"model_name":MODEL_NAMES[model_key],"image_id":r.image_id,"label":int(r.label),"factor":factor,"level":float(val),"p_dfu":p})
+        del model
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+    return pd.DataFrame(rows)
+
+
+def plot_response_curves(resp: pd.DataFrame):
+    import matplotlib.pyplot as plt
+    if resp.empty:return
+    for factor,gf in resp.groupby("factor"):
+        fig,axes=plt.subplots(1,3,figsize=(15,4.8),sharey=True)
+        for ax,(model_name,g) in zip(axes,gf.groupby("model_name",sort=False)):
+            for image_id,gi in g.groupby("image_id"):
+                gi=gi.sort_values("level"); ax.plot(gi.level,gi.p_dfu,alpha=.18,lw=.8)
+            mean=g.groupby("level").p_dfu.mean(); ax.plot(mean.index,mean.values,lw=3,label="PDP-style mean")
+            ax.set_title(model_name); ax.set_xlabel(factor.replace("_"," ")); ax.grid(alpha=.25); ax.legend()
+        axes[0].set_ylabel("Predicted P(DFU)")
+        fig.suptitle(f"ICE/PDP-style Controlled Image Response — {factor.replace('_',' ').title()}\n(thin lines: individual images; bold: mean response)",fontweight="bold")
+        save_fig(fig,f"FigX_ICE_PDP_{factor}")
+
+
+def randomize_last_linear(base_model):
+    import copy, torch.nn as nn
+    m=copy.deepcopy(base_model)
+    last=None
+    for mod in m.modules():
+        if isinstance(mod,nn.Linear): last=mod
+    if last is None: raise RuntimeError("No final Linear layer found")
+    last.reset_parameters(); m.eval()
+    return m
+
+
+def display_results():
+    from IPython.display import display, Markdown, Image as IPImage, JSON as IPJSON
+    try:
+        from google.colab import data_table; data_table.enable_dataframe_formatter()
+    except Exception: pass
+
+    def show_df(title, path, filt=None):
+        path=Path(path)
+        if not path.exists():
+            display(Markdown(f"## {title} — NOT FOUND")); return
+        df=pd.read_csv(path)
+        if filt is not None:
+            try: df=filt(df)
+            except Exception: pass
+        display(Markdown(f"## {title}")); display(df)
+
+    display(Markdown("# ==============================\n# PHASE-2 RESULT SUMMARY\n# =============================="))
+    show_df("PRIMARY PERFORMANCE", PHASE2_ROOT/"tables"/"01_primary_performance.csv")
+    show_df("SIGNIFICANT MODEL COMPARISONS", PHASE2_ROOT/"statistics"/"03_pairwise_statistics_group_clustered_holm.csv",
+            lambda d:d[d.get("significant_holm_0_05",False)==True])
+    show_df("CALIBRATION", PHASE2_ROOT/"tables"/"05_calibration_summary.csv")
+    show_df("CLINICAL OPERATING POINT", PHASE2_ROOT/"tables"/"07_clinical_operating_points.csv")
+    show_df("SELECTIVE REFERRAL", PHASE2_ROOT/"tables"/"08_referral_error_capture.csv")
+    show_df("SIMILARITY / LEAKAGE", PHASE2_ROOT/"tables"/"09_similarity_group_audit.csv")
+    show_df("HARD CASES", PHASE2_ROOT/"tables"/"11_hard_case_consistency.csv")
+    show_df("STABILITY", PHASE2_ROOT/"tables"/"12_model_stability_summary.csv")
+    show_df("CHECKPOINT + PREVIOUS XAI STATUS", PHASE2_ROOT/"tables"/"14_checkpoint_inventory.csv", lambda d:d[d.get("metadata_valid",False)==True])
+
+    display(Markdown("# PHASE-2 KEY FIGURES"))
+    key_phase2=[
+        "Fig02_Performance_Overview.png","Fig05_Model_Comparison_Forest.png",
+        "Fig06_Raw_vs_Calibrated_Reliability.png","Fig08_Clinical_Operating_Point.png",
+        "Fig09_Risk_Coverage.png","Fig10_Referral_Error_Capture.png",
+        "Fig13_Naive_vs_GroupSafe_Leakage.png","Fig14_Hard_Case_Consistency.png",
+        "Fig16_Decision_Curve.png"]
+    for name in key_phase2:
+        q=PHASE2_ROOT/"figures_png"/name
+        if q.exists():
+            display(Markdown(f"## `{name}`")); display(IPImage(filename=str(q),width=1200))
+
+    display(Markdown("# ==============================\n# PHASE-3 ADVANCED XAI RESULTS\n# =============================="))
+    for csv in sorted((OUT_ROOT/"tables").glob("*.csv")):
+        df=pd.read_csv(csv); display(Markdown(f"## `{csv.name}` — {len(df):,} rows × {len(df.columns)} cols")); display(df)
+    for js in sorted((OUT_ROOT/"manifests").glob("*.json")):
+        display(Markdown(f"## `{js.name}`")); display(IPJSON(json.loads(js.read_text(encoding='utf-8')),expanded=False))
+    display(Markdown("# ADVANCED XAI FIGURES"))
