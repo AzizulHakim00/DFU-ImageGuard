@@ -1,0 +1,220 @@
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+    ])
+
+
+def load_image_tensor(path: Path):
+    from PIL import Image
+    im=Image.open(path).convert("RGB")
+    disp=im.resize((IMAGE_SIZE,IMAGE_SIZE))
+    x=image_transform()(im).unsqueeze(0)
+    rgb=np.asarray(disp,dtype=np.float32)/255.0
+    return disp,x,rgb
+
+
+def denormalize_tensor(x):
+    import torch
+    mean=torch.tensor([0.485,0.456,0.406],device=x.device).view(1,3,1,1)
+    std=torch.tensor([0.229,0.224,0.225],device=x.device).view(1,3,1,1)
+    return (x*std+mean).clamp(0,1)
+
+
+def normalize_map(a, signed=False):
+    a=np.asarray(a,dtype=np.float32)
+    a=np.nan_to_num(a,nan=0.0,posinf=0.0,neginf=0.0)
+    if signed:
+        m=float(np.max(np.abs(a)))
+        return a/(m+1e-8)
+    a=np.abs(a)
+    a-=a.min(); a/=max(float(a.max()),1e-8)
+    return a
+
+
+def select_cases(oof: pd.DataFrame, usable: pd.DataFrame, hard: pd.DataFrame) -> pd.DataFrame:
+    hard_small = hard[["image_id","wrong_count_9","wrong_fraction_9","difficulty_category"]].copy()
+    rows=[]
+    for model_key in MODEL_NAMES:
+        trials=usable.loc[usable.model_key==model_key].sort_values(["seed","outer_fold"])
+        if trials.empty: continue
+        # Base checkpoint for correct/uncertain cases = earliest verified identity.
+        base=trials.iloc[0]
+        baseg=oof[(oof.model_key==model_key)&(oof.seed==int(base.seed))&(oof.outer_fold==int(base.outer_fold))].copy()
+        baseg=baseg.merge(hard_small,on="image_id",how="left")
+        baseg["confidence"] = np.maximum(baseg.prob_calibrated,1-baseg.prob_calibrated)
+        baseg["uncertainty"] = np.abs(baseg.prob_calibrated-0.5)
+
+        def add_from(g, case_type, sort_cols, ascending):
+            if g.empty: return False
+            r=g.sort_values(sort_cols,ascending=ascending,kind="stable").iloc[0].copy()
+            rows.append({
+                "model_key":model_key,"model_name":MODEL_NAMES[model_key],"case_type":case_type,
+                "checkpoint_seed":int(r.seed),"checkpoint_fold":int(r.outer_fold),
+                "checkpoint_path":str(r.checkpoint_path),"checkpoint_sha256":str(r.checkpoint_sha256),
+                "image_id":str(r.image_id),"group_id":str(r.group_id),"label":int(r.label),"pred":int(r.pred),
+                "prob_raw":float(r.prob_raw),"prob_calibrated":float(r.prob_calibrated),
+                "temperature":float(r.temperature),"threshold":float(r.threshold),
+                "relative_path":str(r.relative_path),"wrong_count_9":int(r.wrong_count_9) if pd.notna(r.wrong_count_9) else np.nan,
+                "difficulty_category":str(r.difficulty_category) if pd.notna(r.difficulty_category) else "unknown",
+            })
+            return True
+
+        baseg["checkpoint_path"]=str(base.path); baseg["checkpoint_sha256"]=str(base.sha256)
+        add_from(baseg[(baseg.label==1)&(baseg.pred==1)],"confident_true_positive",["confidence","image_id"],[False,True])
+        add_from(baseg[(baseg.label==0)&(baseg.pred==0)],"confident_true_negative",["confidence","image_id"],[False,True])
+        add_from(baseg[baseg.label==1],"uncertain_dfu",["uncertainty","image_id"],[True,True])
+        add_from(baseg[baseg.label==0],"uncertain_normal",["uncertainty","image_id"],[True,True])
+
+        # Error cases search all verified checkpoints for this architecture and select most recurrent global hard image.
+        pooled=[]
+        for _,t in trials.iterrows():
+            g=oof[(oof.model_key==model_key)&(oof.seed==int(t.seed))&(oof.outer_fold==int(t.outer_fold))].copy()
+            g=g.merge(hard_small,on="image_id",how="left")
+            g["checkpoint_path"]=str(t.path); g["checkpoint_sha256"]=str(t.sha256)
+            g["error_margin"] = np.abs(g.prob_calibrated-g.threshold)
+            pooled.append(g)
+        pg=pd.concat(pooled,ignore_index=True)
+        fn=pg[(pg.label==1)&(pg.pred==0)]
+        fp=pg[(pg.label==0)&(pg.pred==1)]
+        if not add_from(fn,"representative_false_negative",["wrong_count_9","error_margin","image_id"],[False,False,True]):
+            print(f"WARNING: no verified-checkpoint FN for {model_key}")
+        if not add_from(fp,"representative_false_positive",["wrong_count_9","error_margin","image_id"],[False,False,True]):
+            print(f"WARNING: no verified-checkpoint FP for {model_key}")
+    out=pd.DataFrame(rows)
+    return out.sort_values(["model_key","case_type"]).reset_index(drop=True)
+
+
+class BinaryProbWrapper:
+    def __init__(self, base):
+        import torch.nn as nn
+        class W(nn.Module):
+            def __init__(self,b): super().__init__(); self.base=b
+            def forward(self,x):
+                import torch
+                z=self.base(x).reshape(-1)
+                p=torch.sigmoid(z)
+                return torch.stack([1-p,p],dim=1)
+        self.module=W(base)
+
+
+def predict_prob(wrapper, x, target_class: int) -> float:
+    import torch
+    with torch.no_grad(): return float(wrapper(x)[:,target_class].detach().cpu().item())
+
+
+def cam_explanation(wrapper, base_model, model_key, x, target_class, method_name):
+    from pytorch_grad_cam import GradCAM, GradCAMPlusPlus, HiResCAM, LayerCAM, ScoreCAM, AblationCAM
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+    cls={"GradCAM":GradCAM,"GradCAM++":GradCAMPlusPlus,"HiResCAM":HiResCAM,"LayerCAM":LayerCAM,"ScoreCAM":ScoreCAM,"AblationCAM":AblationCAM}[method_name]
+    cam=cls(model=wrapper,target_layers=[target_layer(model_key,base_model)])
+    if hasattr(cam,"batch_size"): cam.batch_size=32
+    try:
+        arr=cam(input_tensor=x,targets=[ClassifierOutputTarget(target_class)],eigen_smooth=False,aug_smooth=False)[0]
+    finally:
+        try: cam.__del__()
+        except Exception: pass
+    return normalize_map(arr), False
+
+
+def captum_explanation(wrapper, x, target_class, method_name):
+    import torch
+    from captum.attr import IntegratedGradients, Saliency, NoiseTunnel, GradientShap, Occlusion
+    if method_name=="IntegratedGradients":
+        ig=IntegratedGradients(wrapper); a,delta=ig.attribute(x,target=target_class,baselines=torch.zeros_like(x),n_steps=64,return_convergence_delta=True)
+        arr=a.detach().cpu().numpy()[0].sum(axis=0); return normalize_map(arr,signed=True), True
+    if method_name=="SmoothGrad":
+        sal=Saliency(wrapper); nt=NoiseTunnel(sal)
+        a=nt.attribute(x,target=target_class,nt_type="smoothgrad",nt_samples=24,stdevs=0.08)
+        arr=a.detach().cpu().numpy()[0].sum(axis=0); return normalize_map(arr,signed=True), True
+    if method_name=="GradientSHAP":
+        gs=GradientShap(wrapper); baselines=torch.cat([torch.zeros_like(x), torch.randn_like(x)*0.05],dim=0)
+        a=gs.attribute(x,target=target_class,baselines=baselines,n_samples=32,stdevs=0.05)
+        arr=a.detach().cpu().numpy()[0].sum(axis=0); return normalize_map(arr,signed=True), True
+    if method_name=="Occlusion":
+        oc=Occlusion(wrapper)
+        a=oc.attribute(x,target=target_class,baselines=0,sliding_window_shapes=(3,32,32),strides=(3,16,16),perturbations_per_eval=16)
+        arr=a.detach().cpu().numpy()[0].sum(axis=0); return normalize_map(arr,signed=True), True
+    raise ValueError(method_name)
+
+
+def lime_explanation(wrapper, pil_image, target_class, device):
+    import torch
+    from lime import lime_image
+    from skimage.segmentation import slic
+    tf=image_transform()
+    def classifier_fn(images):
+        xs=torch.stack([tf(__import__('PIL').Image.fromarray(np.asarray(im).astype(np.uint8)).convert('RGB')) for im in images]).to(device)
+        with torch.no_grad(): return wrapper(xs).detach().cpu().numpy()
+    arr=np.asarray(pil_image)
+    explainer=lime_image.LimeImageExplainer(random_state=RNG_SEED)
+    exp=explainer.explain_instance(arr,classifier_fn,top_labels=2,hide_color=0,num_samples=800,
+                                   segmentation_fn=lambda im:slic(im,n_segments=55,compactness=10,sigma=1,start_label=0))
+    seg=exp.segments; signed=np.zeros(seg.shape,np.float32)
+    for segment_id,weight in exp.local_exp.get(int(target_class),[]): signed[seg==segment_id]=float(weight)
+    return normalize_map(signed,signed=True), True
+
+
+def shap_explanation(wrapper, x, target_class, background):
+    import shap
+    # GradientExplainer supports PyTorch models. Wrapper returns two class probabilities.
+    ex=shap.GradientExplainer(wrapper,background)
+    vals=ex.shap_values(x,nsamples=64)
+    if isinstance(vals,list):
+        a=np.asarray(vals[int(target_class)])
+    else:
+        a=np.asarray(vals)
+        # Common new SHAP layout: [N,C,H,W,outputs]
+        if a.ndim==5: a=a[...,int(target_class)]
+    a=np.squeeze(a)
+    if a.ndim==3:
+        # detect channel position
+        if a.shape[0] in (1,3): a=a.sum(axis=0)
+        elif a.shape[-1] in (1,3): a=a.sum(axis=-1)
+    return normalize_map(a,signed=True), True
+
+
+def rise_explanation(wrapper, x, target_class, n_masks=512, grid=7, p1=0.5, batch=64):
+    import torch
+    import torch.nn.functional as F
+    device=x.device; rng=torch.Generator(device=device).manual_seed(RNG_SEED)
+    masks=(torch.rand((n_masks,1,grid,grid),generator=rng,device=device)<p1).float()
+    masks=F.interpolate(masks,size=(IMAGE_SIZE,IMAGE_SIZE),mode="bilinear",align_corners=False)
+    scores=[]
+    with torch.no_grad():
+        for i in range(0,n_masks,batch):
+            mm=masks[i:i+batch]; xx=x*mm
+            scores.append(wrapper(xx)[:,target_class])
+    s=torch.cat(scores)
+    sal=(s.view(-1,1,1,1)*masks).sum(0)[0]/(n_masks*p1)
+    return normalize_map(sal.detach().cpu().numpy()), False
+
+
+def explain_one(method, wrapper, base_model, model_key, x, pil_image, target_class, device, background):
+    if method in FAST_CAM_METHODS+SLOW_CAM_METHODS: return cam_explanation(wrapper,base_model,model_key,x,target_class,method)
+    if method in ("IntegratedGradients","SmoothGrad","GradientSHAP","Occlusion"): return captum_explanation(wrapper,x,target_class,method)
+    if method=="LIME": return lime_explanation(wrapper,pil_image,target_class,device)
+    if method=="SHAP": return shap_explanation(wrapper,x,target_class,background)
+    if method=="RISE": return rise_explanation(wrapper,x,target_class)
+    raise ValueError(method)
+
+
+def target_probability_from_base(base_model,x,target_class):
+    import torch
+    with torch.no_grad():
+        p=torch.sigmoid(base_model(x).reshape(-1))[0]
+    return float(p if target_class==1 else (1-p))
+
+
+def patch_metric_curve(base_model,x,saliency,target_class,steps=10,patches=14):
+    import torch
+    import torch.nn.functional as F
+    # Rank 14x14 patches by mean absolute saliency.
+    sal=torch.tensor(np.abs(saliency),dtype=torch.float32,device=x.device)[None,None]
+    cell=F.adaptive_avg_pool2d(sal,(patches,patches))[0,0]
+    order=torch.argsort(cell.flatten(),descending=True)
+    baseline=torch.zeros_like(x)
+    orig=target_probability_from_base(base_model,x,target_class)
+    dels=[]; ins=[]; fracs=[]
+    for k in range(steps+1):
+        n=int(round((patches*patches)*k/steps))
+        mask=torch.zeros((patches*patches,),device=x.device)
+        if n>0: mask[order[:n]]=1
