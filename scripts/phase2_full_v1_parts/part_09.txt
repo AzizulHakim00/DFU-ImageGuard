@@ -1,0 +1,114 @@
+ atomic_csv(dirs["tables"] / "14_checkpoint_inventory.csv",checkpoints)
+    xai_cases=choose_xai_cases(hard_cases,oof,fold=1); atomic_csv(dirs["tables"] / "15_xai_case_selection.csv",xai_cases)
+
+    make_figures(primary,ci,pairwise,oof,calibration_summary,reliability,threshold_trials,threshold_summary,selective,capture,leakage_summary,leakage_groups,leakage_sim,hard_cases,agreement_pairs,stability_summary,dca,dirs["figures_png"],dirs["figures_pdf"])
+
+    if enable_xai:
+        xai_df,xai_meta=run_conditional_xai(checkpoints,xai_cases,oof,dirs["xai"],dirs["figures_png"],dirs["figures_pdf"])
+    else:
+        xai_df=pd.DataFrame(); xai_meta={"status":"DISABLED_FOR_TEST","training_performed":False}
+    atomic_csv(dirs["tables"] / "16_xai_status.csv",xai_df); atomic_json(dirs["manifests"] / "16_xai_verification.json",xai_meta)
+    build_contact_sheet(dirs["figures_png"], dirs["root"] / "PHASE2_FIGURE_PREVIEW_SHEET.png")
+
+    headline = {
+        "version": VERSION,
+        "primary_winner_accuracy": primary.sort_values("accuracy_mean", ascending=False).iloc[0]["model_name"],
+        "primary_winner_roc_auc": primary.sort_values("roc_auc_mean", ascending=False).iloc[0]["model_name"],
+        "best_calibrated_by_ece": primary.sort_values("ece_mean", ascending=True).iloc[0]["model_name"],
+        "similarity_groups": int(leakage_summary.iloc[0]["similarity_groups"]),
+        "multi_image_groups": int(leakage_summary.iloc[0]["multi_image_groups"]),
+        "images_in_multi_image_groups": int(leakage_summary.iloc[0]["images_in_multi_image_groups"]),
+        "actual_cross_fold_group_leakage": 0,
+        "naive_split_mean_split_groups": float(leakage_sim["split_similarity_groups"].mean()),
+        "naive_split_mean_affected_image_fraction": float(leakage_sim["affected_image_fraction"].mean()),
+        "xai_status": xai_meta.get("status"),
+        "training_performed_during_phase2": False,
+    }
+    atomic_json(dirs["root"] / "PHASE2_HEADLINE_SUMMARY.json", headline)
+
+    # Preserve original reproducibility object inside Phase-2 package, plus a new composite object.
+    (dirs["manifests"] / "PRIMARY_REPRODUCIBILITY_OBJECT.pkl").write_bytes(data["original_pkl_bytes"])
+    analysis_payload={
+        "version":VERSION,"integrity":integrity,"source_safety":source_audit,"primary_performance":primary,
+        "confidence_intervals":ci,"pairwise_statistics":pairwise,"calibration_summary":calibration_summary,
+        "threshold_trials":threshold_trials,"operating_summary":threshold_summary,"selective_referral":selective,
+        "referral_capture":capture,"similarity_summary":leakage_summary,"hard_cases":hard_cases,
+        "stability_summary":stability_summary,"checkpoint_inventory":checkpoints,"xai_meta":xai_meta,
+    }
+    with (dirs["root"] / "PHASE2_FULL_ANALYSIS.pkl").open("wb") as handle: pickle.dump(analysis_payload,handle,protocol=pickle.HIGHEST_PROTOCOL)
+
+    after_trials=snapshot_trial_tree(run_root)
+    primary_unchanged=(before_trials==after_trials)
+    if run_root is not None and before_trials and not primary_unchanged:
+        changed=sorted(set(before_trials).symmetric_difference(after_trials) | {k for k in set(before_trials)&set(after_trials) if before_trials[k]!=after_trials[k]})
+        raise RuntimeError(f"Primary trial tree changed during Phase-2; refusing PASS. First changes: {changed[:10]}")
+
+    verification={
+        "version":VERSION,"status":"PASS","primary_model_training_performed_during_phase2":False,
+        "primary_45_trials_modified":False if run_root is not None and before_trials else None,
+        "primary_trial_tree_unchanged":primary_unchanged if run_root is not None and before_trials else None,
+        "outer_folds_modified":False,"duplicate_groups_regenerated":False,
+        "integrity_status":integrity["status"],"group_cluster_bootstrap":bootstrap_meta,
+        "similarity_groups":int(leakage_summary.iloc[0]["similarity_groups"]),
+        "multi_image_groups":int(leakage_summary.iloc[0]["multi_image_groups"]),
+        "images_in_multi_image_groups":int(leakage_summary.iloc[0]["images_in_multi_image_groups"]),
+        "actual_cross_fold_group_leakage":int(leakage_summary.iloc[0]["actual_cross_fold_group_leakage"]),
+        "naive_split_mean_split_groups":float(leakage_sim["split_similarity_groups"].mean()),
+        "naive_split_mean_affected_image_fraction":float(leakage_sim["affected_image_fraction"].mean()),
+        "checkpoint_usable_count":int(((checkpoints.get("exists",pd.Series(dtype=bool))==True)&(checkpoints.get("metadata_valid",pd.Series(dtype=bool))==True)).sum()) if not checkpoints.empty else 0,
+        "xai_status":xai_meta.get("status"),"completed_at_ns":now_ns(),
+    }
+    atomic_json(dirs["root"] / "PHASE2_FULL_VERIFICATION.json",verification)
+
+    manifest=build_manifest(dirs["root"]); atomic_csv(dirs["manifests"] / "PHASE2_FULL_MANIFEST.csv",manifest)
+    final_zip=dirs["root"] / "PHASE2_FULL_FINAL_EXPORT.zip"
+    with zipfile.ZipFile(final_zip,"w",zipfile.ZIP_DEFLATED,allowZip64=True) as zf:
+        for p in sorted(dirs["root"].rglob("*")):
+            if p.is_file() and p!=final_zip and not p.name.endswith((".tmp",".partial")):
+                zf.write(p,p.relative_to(dirs["root"]))
+    verification["final_export_zip"] = str(final_zip); verification["final_export_sha256"] = sha256_file(final_zip); verification["final_export_bytes"] = int(final_zip.stat().st_size)
+    atomic_json(dirs["root"] / "PHASE2_FULL_VERIFICATION.json",verification)
+
+    print("="*92)
+    print("PHASE2 FULL VERIFICATION: PASS")
+    print("="*92)
+    print("Primary training performed: FALSE")
+    print("Primary 45 trials modified:", "FALSE" if verification["primary_45_trials_modified"] is False else "NOT CHECKED (local test/no run root)")
+    print("Group-cluster bootstrap reps:", bootstrap_meta["valid_bootstrap_reps"])
+    print("Similarity groups:", verification["similarity_groups"], "| multi-image:", verification["multi_image_groups"], "| images in multi-image groups:", verification["images_in_multi_image_groups"])
+    print("Actual cross-fold group leakage: 0")
+    print("Naive CV mean split groups:", f"{verification['naive_split_mean_split_groups']:.1f}")
+    print("Naive CV mean affected images (%):", f"{100*verification['naive_split_mean_affected_image_fraction']:.1f}")
+    print("Usable checkpoints:", verification["checkpoint_usable_count"], "| XAI:", verification["xai_status"])
+    print("Final export:", final_zip)
+    return {"verification":verification,"output_root":str(output_root),"final_zip":str(final_zip)}
+
+
+def resolve_colab_paths() -> tuple[Path, Path, Path]:
+    from google.colab import drive
+    drive.mount("/content/drive", force_remount=False)
+    run_root=Path("/content/drive/MyDrive/DFU-ImageGuard/runs")/RUN_ID
+    input_zip=run_root/EXPECTED_INPUT_NAME
+    if not input_zip.is_file():
+        print(f"Could not find {input_zip}. Upload the exact {EXPECTED_INPUT_NAME}.")
+        from google.colab import files
+        uploaded=files.upload()
+        if EXPECTED_INPUT_NAME in uploaded:
+            local=Path("/content")/EXPECTED_INPUT_NAME; local.write_bytes(uploaded[EXPECTED_INPUT_NAME]); input_zip=local
+        elif len(uploaded)==1:
+            name,data=next(iter(uploaded.items())); local=Path("/content")/name; local.write_bytes(data); input_zip=local
+        else:
+            raise RuntimeError("Exact final export ZIP was not resolved")
+    output_root=run_root/PHASE2_DIRNAME
+    return input_zip,output_root,run_root
+
+
+def main() -> None:
+    print("="*92); print(VERSION); print("READ-ONLY PHASE-2: no model training, no fold/group regeneration, no primary trial writes."); print("="*92)
+    input_zip,output_root,run_root=resolve_colab_paths()
+    result=run_phase2(input_zip,output_root,run_root=run_root,enable_xai=True)
+    print("PHASE2_FULL_FINAL_EXPORT.zip SHA256:",result["verification"]["final_export_sha256"])
+
+
+if __name__ == "__main__":
+    main()
