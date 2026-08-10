@@ -1,0 +1,143 @@
+sklearn.linear_model import LogisticRegression
+    y = np.asarray(y, dtype=int)
+    p = np.clip(np.asarray(p, dtype=float), 1e-7, 1 - 1e-7)
+    logit = np.log(p / (1 - p)).reshape(-1, 1)
+    try:
+        model = LogisticRegression(penalty=None, solver="lbfgs", max_iter=2000)
+        model.fit(logit, y)
+        return float(model.intercept_[0]), float(model.coef_[0, 0])
+    except Exception:
+        model = LogisticRegression(C=1e8, solver="lbfgs", max_iter=2000)
+        model.fit(logit, y)
+        return float(model.intercept_[0]), float(model.coef_[0, 0])
+
+
+def calibration_audit(metrics: pd.DataFrame, oof: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    summary_rows = []
+    reliability_rows = []
+    for m in EXPECTED_MODELS:
+        gm = metrics.loc[metrics["model_key"] == m]
+        go = oof.loc[oof["model_key"] == m]
+        raw_intercept, raw_slope = calibration_intercept_slope(go["label"].to_numpy(), go["prob_raw"].to_numpy(float))
+        cal_intercept, cal_slope = calibration_intercept_slope(go["label"].to_numpy(), go["prob_calibrated"].to_numpy(float))
+        summary_rows.append({
+            "model_key": m,
+            "model_name": model_name(m),
+            "raw_calibration_intercept": raw_intercept,
+            "raw_calibration_slope": raw_slope,
+            "calibrated_calibration_intercept": cal_intercept,
+            "calibrated_calibration_slope": cal_slope,
+            "raw_brier_mean": float(gm["raw_brier"].mean()),
+            "calibrated_brier_mean": float(gm["brier"].mean()),
+            "delta_brier_cal_minus_raw": float(gm["brier"].mean() - gm["raw_brier"].mean()),
+            "raw_ece_mean": float(gm["raw_ece"].mean()),
+            "calibrated_ece_mean": float(gm["ece"].mean()),
+            "delta_ece_cal_minus_raw": float(gm["ece"].mean() - gm["raw_ece"].mean()),
+            "raw_log_loss_mean": float(gm["raw_log_loss"].mean()),
+            "calibrated_log_loss_mean": float(gm["log_loss"].mean()),
+            "delta_log_loss_cal_minus_raw": float(gm["log_loss"].mean() - gm["raw_log_loss"].mean()),
+            "temperature_mean": float(gm["temperature"].mean()),
+            "temperature_sd": float(gm["temperature"].std(ddof=1)),
+            "temperature_min": float(gm["temperature"].min()),
+            "temperature_max": float(gm["temperature"].max()),
+            "threshold_mean": float(gm["threshold"].mean()),
+            "threshold_sd": float(gm["threshold"].std(ddof=1)),
+            "threshold_min": float(gm["threshold"].min()),
+            "threshold_max": float(gm["threshold"].max()),
+        })
+        for probability_type, col in (("raw", "prob_raw"), ("calibrated", "prob_calibrated")):
+            curve = calibration_curve_equal_frequency(go["label"].to_numpy(), go[col].to_numpy(float), bins=10)
+            curve.insert(0, "probability_type", probability_type)
+            curve.insert(0, "model_name", model_name(m))
+            curve.insert(0, "model_key", m)
+            reliability_rows.append(curve)
+    return pd.DataFrame(summary_rows), pd.concat(reliability_rows, ignore_index=True)
+
+
+def threshold_operating_audit(metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    x = metrics[[
+        "model_key", "seed", "outer_fold", "temperature", "threshold", "threshold_rule",
+        "sensitivity", "specificity", "balanced_accuracy", "accuracy", "f1",
+        "raw_brier", "brier", "raw_ece", "ece", "raw_log_loss", "log_loss",
+    ]].copy()
+    x.insert(1, "model_name", x["model_key"].map(model_name))
+    x["target_sensitivity"] = TARGET_SENSITIVITY
+    x["target_met_on_outer_test"] = x["sensitivity"] >= TARGET_SENSITIVITY
+    x["extreme_threshold_ge_0_99"] = x["threshold"] >= 0.99
+    x["extreme_threshold_le_0_01"] = x["threshold"] <= 0.01
+    x["extreme_temperature_le_0_10"] = x["temperature"] <= 0.10
+    x["brier_improved"] = x["brier"] < x["raw_brier"]
+    x["ece_improved"] = x["ece"] < x["raw_ece"]
+    x["log_loss_improved"] = x["log_loss"] < x["raw_log_loss"]
+    summary = x.groupby(["model_key", "model_name"], as_index=False).agg(
+        trials=("outer_fold", "size"),
+        target_met_trials=("target_met_on_outer_test", "sum"),
+        target_met_fraction=("target_met_on_outer_test", "mean"),
+        sensitivity_mean=("sensitivity", "mean"),
+        specificity_mean=("specificity", "mean"),
+        threshold_mean=("threshold", "mean"),
+        threshold_sd=("threshold", "std"),
+        temperature_mean=("temperature", "mean"),
+        extreme_threshold_trials=("extreme_threshold_ge_0_99", "sum"),
+        extreme_temperature_trials=("extreme_temperature_le_0_10", "sum"),
+        brier_improved_trials=("brier_improved", "sum"),
+        ece_improved_trials=("ece_improved", "sum"),
+        log_loss_improved_trials=("log_loss_improved", "sum"),
+    )
+    return x, summary
+
+
+def selective_referral_analysis(oof: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    trial_rows = []
+    capture_rows = []
+    for (m, seed, fold), g0 in oof.groupby(["model_key", "seed", "outer_fold"], sort=False):
+        g = g0.copy().reset_index(drop=True)
+        p = g["prob_calibrated"].to_numpy(float)
+        confidence = np.maximum(p, 1 - p)
+        uncertainty = 1.0 - confidence
+        order = np.argsort(-uncertainty, kind="stable")
+        total_errors = int((g["pred"].to_numpy(int) != g["label"].to_numpy(int)).sum())
+        total_fn = int(((g["label"] == 1) & (g["pred"] == 0)).sum())
+        for referral_rate in REFERRAL_RATES:
+            n_ref = int(round(referral_rate * len(g)))
+            referred_idx = set(order[:n_ref].tolist())
+            keep = np.array([i not in referred_idx for i in range(len(g))], dtype=bool)
+            kept = g.loc[keep]
+            if kept.empty or kept["label"].nunique() < 2:
+                continue
+            md = metric_dict(kept["label"].to_numpy(), kept["prob_calibrated"].to_numpy(float), kept["pred"].to_numpy(int))
+            errors_referred = int(sum((g.loc[i, "pred"] != g.loc[i, "label"]) for i in referred_idx))
+            fn_referred = int(sum((g.loc[i, "label"] == 1 and g.loc[i, "pred"] == 0) for i in referred_idx))
+            trial_rows.append({
+                "model_key": m, "model_name": model_name(m), "seed": int(seed), "outer_fold": int(fold),
+                "coverage": float(1 - referral_rate), "referral_rate": float(referral_rate),
+                "referred_n": int(n_ref), **md,
+            })
+            capture_rows.append({
+                "model_key": m, "model_name": model_name(m), "seed": int(seed), "outer_fold": int(fold),
+                "referral_rate": float(referral_rate), "coverage": float(1 - referral_rate),
+                "total_errors": total_errors, "errors_referred": errors_referred,
+                "error_capture_fraction": float(errors_referred / total_errors) if total_errors else 0.0,
+                "total_false_negatives": total_fn, "false_negatives_referred": fn_referred,
+                "fn_capture_fraction": float(fn_referred / total_fn) if total_fn else 0.0,
+                "remaining_automated_error_rate": float(1 - md["accuracy"]),
+            })
+    trial_df = pd.DataFrame(trial_rows)
+    cap_df = pd.DataFrame(capture_rows)
+    return trial_df, cap_df
+
+
+def similarity_leakage_audit(unique_images: pd.DataFrame, reps: int = LEAKAGE_SIM_REPS, seed: int = RNG_SEED) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    from sklearn.model_selection import StratifiedKFold
+    sizes = unique_images.groupby("group_id", as_index=False).agg(
+        n_images=("image_id", "size"),
+        n_labels=("label", "nunique"),
+        outer_folds=("outer_fold", "nunique"),
+    )
+    summary = pd.DataFrame([{
+        "unique_images": int(len(unique_images)),
+        "similarity_groups": int(len(sizes)),
+        "singleton_groups": int((sizes["n_images"] == 1).sum()),
+        "multi_image_groups": int((sizes["n_images"] > 1).sum()),
+        "images_in_multi_image_groups": int(sizes.loc[sizes["n_images"] > 1, "n_images"].sum()),
+        "fra
