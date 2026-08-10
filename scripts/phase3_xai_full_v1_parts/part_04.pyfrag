@@ -1,0 +1,167 @@
+    for q in sorted((OUT_ROOT/"figures_png").glob("*.png")):
+        display(Markdown(f"## `{q.name}`")); display(IPImage(filename=str(q),width=1250))
+
+def run():
+    print("="*100); print(VERSION); print("READ-ONLY XAI: no training, no fold regeneration, no primary-output modification."); print("="*100)
+    mount_drive(); ensure_packages(); configure_plotting()
+    for d in [OUT_ROOT/"tables",OUT_ROOT/"figures_png",OUT_ROOT/"figures_pdf",OUT_ROOT/"maps",OUT_ROOT/"manifests"]: d.mkdir(parents=True,exist_ok=True)
+    ver,usable,oof,metrics,hard=load_inputs()
+    trial_root=RUN_ROOT/"trials"; before=tree_signature(trial_root)
+    atomic_json(OUT_ROOT/"manifests"/"00_primary_trial_tree_before.json",{"n_files":len(before),"signature":before})
+    dataset_root=locate_dataset_root()
+    case_meta=select_cases(oof,usable,hard); atomic_csv(OUT_ROOT/"tables"/"01_xai_case_selection_model_specific.csv",case_meta)
+    atomic_csv(OUT_ROOT/"tables"/"02_verified_checkpoint_use.csv",usable)
+
+    import torch
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type!="cuda": print("WARNING: GPU not detected; XAI will be slower.")
+    np.random.seed(RNG_SEED); random.seed(RNG_SEED); torch.manual_seed(RNG_SEED)
+
+    dataset_cache={}
+    map_index={}; status_rows=[]; metric_rows=[]; curve_rows=[]; image_cache={}
+    model_cache={}
+    # Prepare a small fixed SHAP background from the first checkpoint's fold.
+    background_cache={}
+
+    for _,r in case_meta.iterrows():
+        model_key=str(r.model_key); seed=int(r.checkpoint_seed); fold=int(r.checkpoint_fold); cp=Path(r.checkpoint_path)
+        cache_key=(model_key,seed,fold)
+        if cache_key not in model_cache:
+            base_model,arch,payload=load_checkpoint_model(model_key,cp,device)
+            wrapper=BinaryProbWrapper(base_model).module.to(device).eval()
+            model_cache[cache_key]=(base_model,wrapper,arch)
+        base_model,wrapper,arch=model_cache[cache_key]
+        path=resolve_image_path(dataset_root,str(r.relative_path)); pil,x,rgb=load_image_tensor(path); x=x.to(device)
+        key=(model_key,str(r.case_type),str(r.image_id),seed,fold)
+        image_cache[key]={"rgb":rgb,"path":str(path)}
+        target_class=int(r.pred)  # explain actual model decision; errors explain the wrong decision.
+
+        if cache_key not in background_cache:
+            gg=oof[(oof.model_key==model_key)&(oof.seed==seed)&(oof.outer_fold==fold)].sort_values("image_id").head(6)
+            bgs=[]
+            for _,br in gg.iterrows():
+                bp=resolve_image_path(dataset_root,br.relative_path); _,bx,_=load_image_tensor(bp); bgs.append(bx[0])
+            background_cache[cache_key]=torch.stack(bgs).to(device)
+        background=background_cache[cache_key]
+
+        for method in ALL_METHODS:
+            t0=time.time(); entry={"status":"FAIL"}
+            try:
+                sal,signed=explain_one(method,wrapper,base_model,model_key,x,pil,target_class,device,background)
+                if sal.shape!=(IMAGE_SIZE,IMAGE_SIZE):
+                    from skimage.transform import resize
+                    sal=resize(sal,(IMAGE_SIZE,IMAGE_SIZE),preserve_range=True,anti_aliasing=True)
+                sal=normalize_map(sal,signed=signed)
+                entry={"status":"PASS","map":sal,"signed":signed}
+                metrics_one=patch_metric_curve(base_model,x,sal,target_class,steps=10,patches=14)
+                ent,conc=map_entropy_and_concentration(sal)
+                metric_rows.append({"model_key":model_key,"model_name":MODEL_NAMES[model_key],"case_type":r.case_type,"image_id":r.image_id,
+                                    "checkpoint_seed":seed,"checkpoint_fold":fold,"method":method,"target_class":target_class,
+                                    "deletion_auc":metrics_one["deletion_auc"],"insertion_auc":metrics_one["insertion_auc"],
+                                    "top20_confidence_drop":metrics_one["top20_confidence_drop"],"entropy":ent,"top10_mass_concentration":conc})
+                for f,dv,iv in zip(metrics_one["curve_fraction"],metrics_one["deletion_curve"],metrics_one["insertion_curve"]):
+                    curve_rows.append({"model_key":model_key,"case_type":r.case_type,"method":method,"fraction":f,"deletion_score":dv,"insertion_score":iv})
+                np.save(OUT_ROOT/"maps"/f"{model_key}__s{seed}__f{fold}__{r.case_type}__{method.replace('/','_')}.npy",sal)
+                err=""
+            except Exception as e:
+                err=f"{type(e).__name__}: {e}"
+            map_index[(key,method)]=entry
+            status_rows.append({"model_key":model_key,"model_name":MODEL_NAMES[model_key],"case_type":r.case_type,"image_id":r.image_id,
+                                "checkpoint_seed":seed,"checkpoint_fold":fold,"method":method,"status":entry["status"],"seconds":time.time()-t0,"error":err})
+            print(f"XAI {model_key} s{seed} f{fold} {r.case_type:30s} {method:20s} {entry['status']}")
+
+    status=pd.DataFrame(status_rows); metrics_df=pd.DataFrame(metric_rows); curves=pd.DataFrame(curve_rows)
+    atomic_csv(OUT_ROOT/"tables"/"03_xai_method_status.csv",status)
+    atomic_csv(OUT_ROOT/"tables"/"04_xai_faithfulness_case_metrics.csv",metrics_df)
+    atomic_csv(OUT_ROOT/"tables"/"05_xai_deletion_insertion_curves.csv",curves)
+
+    # Summary
+    summary=metrics_df.groupby("method",as_index=False).agg(
+        n=("deletion_auc","size"),deletion_auc_mean=("deletion_auc","mean"),deletion_auc_sd=("deletion_auc","std"),
+        insertion_auc_mean=("insertion_auc","mean"),insertion_auc_sd=("insertion_auc","std"),
+        top20_confidence_drop_mean=("top20_confidence_drop","mean"),entropy_mean=("entropy","mean"),
+        top10_mass_concentration_mean=("top10_mass_concentration","mean"))
+    atomic_csv(OUT_ROOT/"tables"/"06_xai_method_summary.csv",summary)
+
+    # Cross-method agreement on maps available for the same cases.
+    agree_rows=[]
+    for key in sorted(set(k for k,m in map_index.keys())):
+        avail={m:map_index[(key,m)]["map"] for m in ALL_METHODS if (key,m) in map_index and map_index[(key,m)].get("status")=="PASS"}
+        ms=list(avail)
+        for i,a in enumerate(ms):
+            for b in ms[i+1:]:
+                agree_rows.append({"model_key":key[0],"case_type":key[1],"image_id":key[2],"method_a":a,"method_b":b,"spearman":map_corr(avail[a],avail[b])})
+    agreement_case=pd.DataFrame(agree_rows)
+    agreement=agreement_case.groupby(["method_a","method_b"],as_index=False).agg(mean_spearman=("spearman","mean"),sd_spearman=("spearman","std"),n=("spearman","count")) if not agreement_case.empty else pd.DataFrame()
+    atomic_csv(OUT_ROOT/"tables"/"07_xai_agreement_case_level.csv",agreement_case)
+    atomic_csv(OUT_ROOT/"tables"/"07_xai_agreement_summary.csv",agreement)
+
+    # Sanity check: randomize final linear head; use GradCAM and IntegratedGradients on one TP + one TN per model.
+    sanity_rows=[]
+    for model_key in MODEL_NAMES:
+        subset=case_meta[(case_meta.model_key==model_key)&(case_meta.case_type.isin(["confident_true_positive","confident_true_negative"]))]
+        for _,r in subset.iterrows():
+            seed=int(r.checkpoint_seed); fold=int(r.checkpoint_fold); cache_key=(model_key,seed,fold)
+            base_model,wrapper,_=model_cache[cache_key]
+            key=(model_key,str(r.case_type),str(r.image_id),seed,fold)
+            path=Path(image_cache[key]["path"]); pil,x,_=load_image_tensor(path); x=x.to(device); target=int(r.pred)
+            rnd=randomize_last_linear(base_model).to(device).eval(); rndw=BinaryProbWrapper(rnd).module.to(device).eval()
+            for method in ["GradCAM","IntegratedGradients"]:
+                orig=map_index.get((key,method))
+                if not orig or orig.get("status")!="PASS": continue
+                try:
+                    if method=="GradCAM": smap,_=cam_explanation(rndw,rnd,model_key,x,target,"GradCAM")
+                    else: smap,_=captum_explanation(rndw,x,target,"IntegratedGradients")
+                    rho=map_corr(orig["map"],smap)
+                    sanity_rows.append({"model_key":model_key,"case_type":r.case_type,"method":method,"saliency_spearman_after_head_randomization":rho})
+                except Exception as e:
+                    sanity_rows.append({"model_key":model_key,"case_type":r.case_type,"method":method,"saliency_spearman_after_head_randomization":np.nan,"error":str(e)})
+    sanity=pd.DataFrame(sanity_rows); atomic_csv(OUT_ROOT/"tables"/"08_xai_parameter_randomization_sanity.csv",sanity)
+
+    # Controlled image perturbation response curves (ICE/PDP-style, not classical tabular PDP).
+    response=controlled_response_curves(oof,usable,dataset_root,device)
+    atomic_csv(OUT_ROOT/"tables"/"09_ice_pdp_style_controlled_response.csv",response)
+
+    # Plots.
+    make_case_panels(case_meta,map_index,image_cache)
+    plot_quantitative(summary,agreement,sanity,curves)
+    plot_response_curves(response)
+
+    # Provenance + final verification.
+    after=tree_signature(trial_root)
+    unchanged=(before==after)
+    if not unchanged: raise RuntimeError("Primary trial tree changed during Phase-3 XAI; refusing export")
+    verification={
+        "version":VERSION,"status":"PASS","primary_training_performed":False,"primary_trials_modified":False,
+        "primary_trial_tree_unchanged":True,"verified_checkpoints_used":int(len(usable)),
+        "selected_case_rows":int(len(case_meta)),"xai_methods":list(ALL_METHODS),
+        "method_status_counts":status.status.value_counts().to_dict(),
+        "note_ice_pdp":"ICE/PDP-style plots vary controlled image-acquisition perturbation factors; they are not classical raw-pixel PDP/ICE.",
+        "created_at_ns":time.time_ns(),
+    }
+    atomic_json(OUT_ROOT/"PHASE3_XAI_VERIFICATION.json",verification)
+
+    payload={"verification":verification,"case_selection":case_meta,"method_status":status,"faithfulness":metrics_df,"method_summary":summary,
+             "agreement":agreement,"sanity":sanity,"controlled_response":response}
+    with open(OUT_ROOT/"PHASE3_XAI_ANALYSIS.pkl","wb") as f: pickle.dump(payload,f)
+
+    # Manifest and zip.
+    files=[]
+    for p in sorted(OUT_ROOT.rglob("*")):
+        if p.is_file() and p.name!="PHASE3_XAI_FINAL_EXPORT.zip":
+            files.append({"relative_path":str(p.relative_to(OUT_ROOT)),"bytes":int(p.stat().st_size),"sha256":sha256_file(p)})
+    atomic_csv(OUT_ROOT/"manifests"/"PHASE3_XAI_MANIFEST.csv",pd.DataFrame(files))
+    final_zip=OUT_ROOT/"PHASE3_XAI_FINAL_EXPORT.zip"
+    with zipfile.ZipFile(final_zip,"w",zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(OUT_ROOT.rglob("*")):
+            if p.is_file() and p!=final_zip: z.write(p,p.relative_to(OUT_ROOT))
+    verification["final_export"]=str(final_zip); verification["final_export_sha256"]=sha256_file(final_zip)
+    atomic_json(OUT_ROOT/"PHASE3_XAI_VERIFICATION.json",verification)
+
+    print("\n"+"="*100); print("PHASE-3 XAI VERIFICATION: PASS"); print("Primary training performed: FALSE"); print("Primary 45 trials modified: FALSE")
+    print("Verified checkpoints used:",len(usable)); print("XAI method status:",status.status.value_counts().to_dict()); print("Final export:",final_zip); print("="*100)
+    display_results()
+
+
+if __name__ == "__main__":
+    run()
