@@ -1,0 +1,182 @@
+ rows.append(record)
+    return pd.DataFrame(rows)
+
+
+def choose_xai_cases(hard_cases: pd.DataFrame, oof: pd.DataFrame, fold: int = 1) -> pd.DataFrame:
+    x = hard_cases.loc[hard_cases["outer_fold"] == fold].copy()
+    if x.empty:
+        return pd.DataFrame()
+    x["uncertainty"] = np.abs(x["mean_probability"] - 0.5)
+    candidates: list[dict[str, Any]] = []
+    used: set[str] = set()
+    def take(frame: pd.DataFrame, name: str, sort_cols: list[str], ascending: list[bool]):
+        frame = frame.loc[~frame["image_id"].astype(str).isin(used)].copy()
+        if frame.empty:
+            return
+        r = frame.sort_values(sort_cols, ascending=ascending, kind="stable").iloc[0]
+        used.add(str(r["image_id"]))
+        candidates.append({"case_type": name, **r.to_dict()})
+    take(x[(x["label"] == 1) & (x["wrong_count_9"] == 0)], "confident_true_positive", ["mean_confidence"], [False])
+    take(x[(x["label"] == 0) & (x["wrong_count_9"] == 0)], "confident_true_negative", ["mean_confidence"], [False])
+    take(x[(x["label"] == 1) & (x["wrong_count_9"] > 0)], "persistent_false_negative", ["wrong_count_9", "mean_confidence"], [False, False])
+    take(x[(x["label"] == 0) & (x["wrong_count_9"] > 0)], "persistent_false_positive", ["wrong_count_9", "mean_confidence"], [False, False])
+    take(x[x["label"] == 1], "uncertain_dfu", ["uncertainty", "wrong_count_9"], [True, False])
+    take(x[x["label"] == 0], "uncertain_normal", ["uncertainty", "wrong_count_9"], [True, False])
+    out = pd.DataFrame(candidates)
+    if not out.empty and "relative_path" in oof.columns:
+        meta = oof[["image_id", "relative_path"]].drop_duplicates("image_id")
+        out = out.merge(meta, on="image_id", how="left")
+    return out
+
+
+def resolve_dataset_root_if_needed(xai_cases: pd.DataFrame) -> Path | None:
+    if xai_cases.empty:
+        return None
+    try:
+        import kagglehub
+        root = Path(kagglehub.dataset_download("laithjj/diabetic-foot-ulcer-dfu"))
+        return root
+    except Exception as exc:
+        print("XAI dataset resolution unavailable:", type(exc).__name__, exc)
+        return None
+
+
+def build_model_for_xai(model_key: str):
+    import timm
+    errors = []
+    for candidate in MODEL_CANDIDATES[model_key]:
+        try:
+            return timm.create_model(candidate, pretrained=False, num_classes=1, drop_rate=0.20)
+        except Exception as exc:
+            errors.append(f"{candidate}: {type(exc).__name__}: {exc}")
+    raise RuntimeError("Could not instantiate XAI model: " + " | ".join(errors))
+
+
+def xai_target_layer(model_key: str, model):
+    if model_key == "convnextv2_tiny":
+        return model.stages[-1]
+    if model_key == "densenet121":
+        return model.features
+    if model_key == "mobilenetv3_large":
+        return model.blocks[-1]
+    raise ValueError(model_key)
+
+
+def prepare_image_tensor(path: Path):
+    from PIL import Image
+    import torch
+    from torchvision import transforms
+    image = Image.open(path).convert("RGB")
+    tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    return image, tf(image).unsqueeze(0)
+
+
+def gradcam_map(model, model_key: str, tensor, device):
+    import torch
+    activations = []
+    layer = xai_target_layer(model_key, model)
+    handle = layer.register_forward_hook(lambda _m, _i, out: activations.append(out))
+    try:
+        output = model(tensor.to(device)).reshape(-1)[0]
+        if not activations:
+            raise RuntimeError("target layer produced no activation")
+        act = activations[-1]
+        grad = torch.autograd.grad(output, act, retain_graph=False, create_graph=False)[0]
+        if act.ndim != 4 or grad.ndim != 4:
+            raise RuntimeError(f"Grad-CAM requires 4D activation; got {tuple(act.shape)}")
+        weights = grad.mean(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weights * act).sum(dim=1, keepdim=True))
+        cam = torch.nn.functional.interpolate(cam, size=(224, 224), mode="bilinear", align_corners=False)
+        cam = cam[0, 0].detach().float().cpu().numpy()
+        cam -= cam.min()
+        cam /= max(cam.max(), 1e-8)
+        prob = float(torch.sigmoid(output.detach()).cpu())
+        return cam, prob
+    finally:
+        handle.remove()
+
+
+def lime_map(model, tensor_device, image, device):
+    from lime import lime_image
+    from skimage.segmentation import mark_boundaries
+    import torch
+    from torchvision import transforms
+    arr = np.asarray(image.resize((224, 224)), dtype=np.uint8)
+    normalize = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+    def classifier(images):
+        batch = torch.stack([normalize(np.asarray(im, dtype=np.uint8)) for im in images]).to(device)
+        with torch.inference_mode():
+            p = torch.sigmoid(model(batch).reshape(-1)).float().cpu().numpy()
+        return np.column_stack([1 - p, p])
+    explainer = lime_image.LimeImageExplainer(random_state=RNG_SEED)
+    explanation = explainer.explain_instance(arr, classifier, labels=(1,), num_samples=250, hide_color=0)
+    _, mask = explanation.get_image_and_mask(1, positive_only=False, num_features=8, hide_rest=False)
+    boundary = mark_boundaries(arr / 255.0, mask)
+    return boundary
+
+
+def shap_map(model, tensor, device):
+    import shap
+    import torch
+    class Wrapper(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+        def forward(self, x):
+            return self.inner(x).reshape(-1, 1)
+    wrapped = Wrapper(model)
+    background = torch.zeros((2, *tensor.shape[1:]), dtype=tensor.dtype, device=device)
+    explainer = shap.GradientExplainer(wrapped, background)
+    values = explainer.shap_values(tensor.to(device), nsamples=32)
+    arr = values[0] if isinstance(values, list) else values
+    arr = np.asarray(arr)
+    if arr.ndim == 5:
+        arr = arr[..., 0]
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.shape[0] in (1, 3):
+        heat = np.mean(np.abs(arr), axis=0)
+    elif arr.shape[-1] in (1, 3):
+        heat = np.mean(np.abs(arr), axis=-1)
+    else:
+        raise RuntimeError(f"Unexpected SHAP shape {arr.shape}")
+    heat -= heat.min()
+    heat /= max(heat.max(), 1e-8)
+    return heat
+
+
+def run_conditional_xai(checkpoints: pd.DataFrame, cases: pd.DataFrame, oof: pd.DataFrame, out_root: Path, png_dir: Path, pdf_dir: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    usable = checkpoints[(checkpoints["exists"] == True) & (checkpoints["metadata_valid"] == True) & (checkpoints["outer_fold"] == 1)].copy()
+    if usable.empty or cases.empty:
+        return pd.DataFrame(), {"status": "SKIPPED", "reason": "no usable Fold-1 checkpoints or no selected cases", "training_performed": False}
+    ensure_packages({"timm": "timm", "lime": "lime", "shap": "shap", "skimage": "scikit-image"})
+    dataset_root = resolve_dataset_root_if_needed(cases)
+    if dataset_root is None:
+        return pd.DataFrame(), {"status": "SKIPPED", "reason": "dataset unavailable for XAI", "training_performed": False}
+
+    import torch
+    import matplotlib.pyplot as plt
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    xai_rows = []
+    selected_models = []
+    for m in EXPECTED_MODELS:
+        candidates = usable[usable["model_key"] == m].sort_values(["seed", "outer_fold"])
+        if candidates.empty:
+            continue
+        selected_models.append(m)
+        ck = candidates.iloc[0]
+        model = build_model_for_xai(m)
+        payload = torch.load(Path(ck["path"]), map_location="cpu", weights_only=False)
+        model.load_state_dict(payload["state_dict"], strict=True)
+        model = model.to(device).eval()
+        for _, case in cases.iterrows():
+            rel = str(case.get("relative_path", ""))
+            image_path = dataset_root / rel
+            if not image_path.is_file():
