@@ -1,0 +1,124 @@
+difficult","persistent_difficult","universal_failure"]
+    counts=hard_cases["difficulty_category"].value_counts().reindex(order,fill_value=0)
+    fig,ax=plt.subplots(figsize=(9,5.5)); xpos=np.arange(len(counts)); ax.bar(xpos,counts.values); ax.set_xticks(xpos); ax.set_xticklabels(counts.index,rotation=20,ha="right"); ax.set_ylabel("Unique images"); ax.set_title("Cross-Model/Seed Hard-Case Consistency",fontweight="bold"); ax.grid(axis="y",alpha=.25)
+    save_figure(fig,png_dir,pdf_dir,"Fig14_Hard_Case_Consistency")
+
+    # Fig15 architecture agreement
+    fig,ax=plt.subplots(figsize=(8,5)); x=np.arange(len(agreement_pairs)); ax.bar(x,agreement_pairs["majority_prediction_agreement"]); ax.set_xticks(x); ax.set_xticklabels([f"{a}\nvs\n{b}" for a,b in zip(agreement_pairs.model_a,agreement_pairs.model_b)]); ax.set_ylim(.9,1.005); ax.set_ylabel("Agreement fraction"); ax.set_title("Cross-Architecture Majority-Prediction Agreement",fontweight="bold"); ax.grid(axis="y",alpha=.25)
+    save_figure(fig,png_dir,pdf_dir,"Fig15_Cross_Model_Agreement")
+
+    # Fig16 DCA
+    fig,ax=plt.subplots(figsize=(9,6))
+    for m in EXPECTED_MODELS:
+        g=dca[(dca.model_key==m)&(dca.strategy=="model")]; ax.plot(g.threshold_probability,g.net_benefit,lw=2,label=model_name(m))
+    ref=dca[(dca.model_key==EXPECTED_MODELS[0])]; allg=ref[ref.strategy=="treat_all"]; none=ref[ref.strategy=="treat_none"]
+    ax.plot(allg.threshold_probability,allg.net_benefit,ls="--",lw=1.5,label="Treat all"); ax.plot(none.threshold_probability,none.net_benefit,ls=":",lw=1.5,label="Treat none")
+    ax.set_xlabel("Threshold probability"); ax.set_ylabel("Net benefit"); ax.set_title("Decision Curve Analysis (Seed-Averaged OOF Probabilities)",fontweight="bold"); ax.set_ylim(-.1,.55); ax.grid(alpha=.25); ax.legend()
+    save_figure(fig,png_dir,pdf_dir,"Fig16_Decision_Curve")
+
+
+
+def build_contact_sheet(png_dir: Path, output_path: Path) -> None:
+    try:
+        from PIL import Image, ImageDraw, ImageOps
+        candidates = sorted([p for p in png_dir.glob("Fig*.png") if p.is_file()])[:16]
+        if not candidates:
+            return
+        thumb_w, thumb_h = 560, 390
+        margin, title_h, cols = 18, 34, 2
+        rows = int(math.ceil(len(candidates) / cols))
+        sheet = Image.new("RGB", (cols * (thumb_w + margin) + margin, rows * (thumb_h + title_h + margin) + margin), "white")
+        draw = ImageDraw.Draw(sheet)
+        for i, path in enumerate(candidates):
+            image = Image.open(path).convert("RGB")
+            fitted = ImageOps.contain(image, (thumb_w, thumb_h))
+            row, col = divmod(i, cols)
+            x = margin + col * (thumb_w + margin)
+            y = margin + row * (thumb_h + title_h + margin)
+            draw.text((x + 4, y + 5), path.stem, fill="black")
+            sheet.paste(fitted, (x + (thumb_w - fitted.width) // 2, y + title_h))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sheet.save(output_path, quality=95)
+    except Exception as exc:
+        print("Preview contact sheet skipped:", type(exc).__name__, exc)
+
+def build_manifest(root: Path) -> pd.DataFrame:
+    rows=[]
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and not p.name.endswith((".tmp", ".partial")):
+            rows.append({"relative_path":str(p.relative_to(root)),"bytes":int(p.stat().st_size),"sha256":sha256_file(p)})
+    return pd.DataFrame(rows)
+
+
+def run_phase2(input_zip: Path, output_root: Path, run_root: Path | None = None, enable_xai: bool = True, bootstrap_reps: int = BOOTSTRAP_REPS, leakage_reps: int = LEAKAGE_SIM_REPS) -> dict[str, Any]:
+    ensure_packages({"scipy":"scipy","sklearn":"scikit-learn","matplotlib":"matplotlib"})
+    configure_matplotlib()
+    source_audit = static_self_audit()
+    input_zip = Path(input_zip)
+    if not input_zip.is_file():
+        raise FileNotFoundError(input_zip)
+
+    output_root = Path(output_root)
+    if output_root.exists():
+        # never delete anything outside the dedicated Phase-2 directory
+        if output_root.name != PHASE2_DIRNAME:
+            raise RuntimeError(f"Refusing to clean unexpected output directory: {output_root}")
+        shutil.rmtree(output_root)
+    dirs = {
+        "root": output_root,
+        "tables": output_root / "tables",
+        "figures_png": output_root / "figures_png",
+        "figures_pdf": output_root / "figures_pdf",
+        "statistics": output_root / "statistics",
+        "manifests": output_root / "manifests",
+        "xai": output_root / "xai",
+    }
+    for d in dirs.values(): Path(d).mkdir(parents=True, exist_ok=True)
+    source_path = Path(__file__) if "__file__" in globals() else None
+    if source_path is not None and source_path.is_file():
+        shutil.copy2(source_path, dirs["manifests"] / "PHASE2_FULL_SOURCE.py")
+
+    before_trials = snapshot_trial_tree(run_root)
+    data = load_export_zip(input_zip)
+    unique_images, integrity = integrity_gate(data, input_zip)
+    atomic_json(dirs["manifests"] / "00_primary_integrity_verification.json", integrity)
+    atomic_json(dirs["manifests"] / "00_phase2_source_safety.json", source_audit)
+
+    metrics = data["metrics"].copy(); oof = data["oof"].copy()
+    metrics["model_name"] = metrics["model_key"].map(model_name); oof["model_name"] = oof["model_key"].map(model_name)
+
+    primary = primary_performance(metrics)
+    atomic_csv(dirs["tables"] / "01_primary_performance.csv", primary)
+
+    ci, pairwise, bootstrap_meta = group_cluster_bootstrap(oof, reps=bootstrap_reps)
+    atomic_csv(dirs["statistics"] / "02_metric_confidence_intervals_group_clustered.csv", ci)
+    atomic_csv(dirs["statistics"] / "03_pairwise_statistics_group_clustered_holm.csv", pairwise)
+    atomic_json(dirs["statistics"] / "03_group_bootstrap_metadata.json", bootstrap_meta)
+
+    # pooled confusion summary
+    conf_rows=[]
+    for m in EXPECTED_MODELS:
+        g=oof[oof.model_key==m]; md=metric_dict(g.label.to_numpy(),g.prob_calibrated.to_numpy(float),g.pred.to_numpy(int)); conf_rows.append({"model_key":m,"model_name":model_name(m),**md,"unique_images":int(g.image_id.nunique()),"repeated_seed_predictions":int(len(g))})
+    confusion=pd.DataFrame(conf_rows); atomic_csv(dirs["tables"] / "04_confusion_summary.csv", confusion)
+
+    calibration_summary, reliability = calibration_audit(metrics,oof)
+    atomic_csv(dirs["tables"] / "05_calibration_summary.csv",calibration_summary); atomic_csv(dirs["tables"] / "05_reliability_bins_equal_frequency.csv",reliability)
+
+    threshold_trials, threshold_summary=threshold_operating_audit(metrics)
+    atomic_csv(dirs["tables"] / "06_temperature_threshold_audit.csv",threshold_trials); atomic_csv(dirs["tables"] / "07_clinical_operating_points.csv",threshold_summary)
+
+    selective,capture=selective_referral_analysis(oof)
+    atomic_csv(dirs["tables"] / "08_selective_referral_trial_level.csv",selective); atomic_csv(dirs["tables"] / "08_referral_error_capture.csv",capture)
+
+    leakage_summary, leakage_groups, leakage_sim=similarity_leakage_audit(unique_images,reps=leakage_reps)
+    atomic_csv(dirs["tables"] / "09_similarity_group_audit.csv",leakage_summary); atomic_csv(dirs["tables"] / "09_similarity_group_sizes.csv",leakage_groups); atomic_csv(dirs["tables"] / "10_naive_split_leakage_simulation.csv",leakage_sim)
+
+    hard_cases, architecture_agreement, agreement_pairs=hard_case_analysis(oof)
+    atomic_csv(dirs["tables"] / "11_hard_case_consistency.csv",hard_cases); atomic_csv(dirs["tables"] / "11_architecture_majority_agreement_by_image.csv",architecture_agreement); atomic_csv(dirs["tables"] / "11_pairwise_architecture_agreement.csv",agreement_pairs)
+
+    stability_per_image,stability_summary=stability_analysis(oof,metrics)
+    atomic_csv(dirs["tables"] / "12_seed_stability_per_image.csv",stability_per_image); atomic_csv(dirs["tables"] / "12_model_stability_summary.csv",stability_summary)
+
+    dca=decision_curve(oof); atomic_csv(dirs["tables"] / "13_decision_curve_analysis.csv",dca)
+
+    checkpoints=checkpoint_inventory(run_root);
