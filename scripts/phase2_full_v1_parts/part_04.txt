@@ -1,0 +1,152 @@
+ction_images_in_multi_image_groups": float(sizes.loc[sizes["n_images"] > 1, "n_images"].sum() / len(unique_images)),
+        "largest_group_size": int(sizes["n_images"].max()),
+        "cross_label_group_conflicts": int((sizes["n_labels"] > 1).sum()),
+        "actual_cross_fold_group_leakage": int((sizes["outer_folds"] > 1).sum()),
+    }])
+
+    frame = unique_images.reset_index(drop=True).copy()
+    sim_rows = []
+    for i in range(int(reps)):
+        rs = int(seed + i)
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=rs)
+        simulated = np.empty(len(frame), dtype=int)
+        for fold, (_, test_idx) in enumerate(skf.split(frame, frame["label"].to_numpy())):
+            simulated[test_idx] = fold
+        tmp = frame.assign(simulated_fold=simulated)
+        span = tmp.groupby("group_id")["simulated_fold"].nunique()
+        bad_groups = set(span[span > 1].index.astype(str))
+        affected = int(tmp["group_id"].astype(str).isin(bad_groups).sum())
+        sim_rows.append({
+            "replicate": i + 1,
+            "random_state": rs,
+            "split_similarity_groups": int(len(bad_groups)),
+            "affected_images": affected,
+            "affected_image_fraction": float(affected / len(tmp)),
+            "group_leakage_present": bool(len(bad_groups) > 0),
+        })
+    return summary, sizes, pd.DataFrame(sim_rows)
+
+
+def hard_case_analysis(oof: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    x = oof.copy()
+    x["is_error"] = x["pred"] != x["label"]
+    x["confidence"] = np.maximum(x["prob_calibrated"], 1 - x["prob_calibrated"])
+    image = x.groupby(["image_id", "group_id", "label", "outer_fold"], as_index=False).agg(
+        wrong_count_9=("is_error", "sum"),
+        mean_probability=("prob_calibrated", "mean"),
+        probability_sd=("prob_calibrated", "std"),
+        mean_confidence=("confidence", "mean"),
+    )
+    image["wrong_fraction_9"] = image["wrong_count_9"] / 9.0
+    image["difficulty_category"] = pd.cut(
+        image["wrong_count_9"],
+        bins=[-1, 0, 2, 5, 8, 9],
+        labels=["easy_stable", "occasional_instability", "difficult", "persistent_difficult", "universal_failure"],
+    ).astype(str)
+    for m in EXPECTED_MODELS:
+        gm = x.loc[x["model_key"] == m].groupby("image_id", as_index=False).agg(
+            **{f"{m}_wrong_count_3": ("is_error", "sum")},
+            **{f"{m}_probability_sd_3": ("prob_calibrated", "std")},
+            **{f"{m}_mean_probability_3": ("prob_calibrated", "mean")},
+        )
+        image = image.merge(gm, on="image_id", how="left")
+
+    majority_rows = []
+    for m in EXPECTED_MODELS:
+        gm = x.loc[x["model_key"] == m].groupby("image_id").agg(label=("label", "first"), votes=("pred", "sum"), mean_p=("prob_calibrated", "mean"))
+        gm[f"{m}_majority_pred"] = (gm["votes"] >= 2).astype(int)
+        majority_rows.append(gm[[f"{m}_majority_pred"]])
+    majority = pd.concat(majority_rows, axis=1).reset_index()
+    agree = majority.copy()
+    pred_cols = [f"{m}_majority_pred" for m in EXPECTED_MODELS]
+    agree["unanimous_architecture_agreement"] = agree[pred_cols].nunique(axis=1) == 1
+    pair_rows = []
+    for i, a in enumerate(EXPECTED_MODELS):
+        for b in EXPECTED_MODELS[i + 1:]:
+            pair_rows.append({
+                "model_a": model_name(a), "model_b": model_name(b),
+                "majority_prediction_agreement": float((agree[f"{a}_majority_pred"] == agree[f"{b}_majority_pred"]).mean()),
+            })
+    return image, agree, pd.DataFrame(pair_rows)
+
+
+def stability_analysis(oof: pd.DataFrame, metrics: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows = []
+    for (m, image_id), g in oof.groupby(["model_key", "image_id"], sort=False):
+        probs = g["prob_calibrated"].to_numpy(float)
+        preds = g["pred"].to_numpy(int)
+        rows.append({
+            "model_key": m, "model_name": model_name(m), "image_id": image_id,
+            "probability_mean": float(probs.mean()), "probability_sd_across_seeds": float(probs.std(ddof=1)),
+            "prediction_agreement_3of3": bool(len(set(preds.tolist())) == 1),
+            "positive_votes": int(preds.sum()),
+        })
+    per_image = pd.DataFrame(rows)
+    summary = per_image.groupby(["model_key", "model_name"], as_index=False).agg(
+        images=("image_id", "nunique"),
+        mean_probability_sd_across_seeds=("probability_sd_across_seeds", "mean"),
+        median_probability_sd_across_seeds=("probability_sd_across_seeds", "median"),
+        prediction_agreement_fraction=("prediction_agreement_3of3", "mean"),
+    )
+    fold_var = metrics.groupby("model_key")["accuracy"].std(ddof=1).rename("accuracy_sd_15_trials").reset_index()
+    fold_var["model_name"] = fold_var["model_key"].map(model_name)
+    summary = summary.merge(fold_var[["model_key", "accuracy_sd_15_trials"]], on="model_key", how="left")
+    return per_image, summary
+
+
+def decision_curve(oof: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    thresholds = np.linspace(0.05, 0.95, 37)
+    # seed-average per image to avoid counting the same image three times in architecture-level DCA
+    for m in EXPECTED_MODELS:
+        gm = oof.loc[oof["model_key"] == m].groupby("image_id", as_index=False).agg(label=("label", "first"), probability=("prob_calibrated", "mean"))
+        y = gm["label"].to_numpy(int)
+        p = gm["probability"].to_numpy(float)
+        n = len(gm)
+        prevalence = float(y.mean())
+        for pt in thresholds:
+            pred = p >= pt
+            tp = int(((pred == 1) & (y == 1)).sum())
+            fp = int(((pred == 1) & (y == 0)).sum())
+            nb = tp / n - fp / n * (pt / (1 - pt))
+            treat_all = prevalence - (1 - prevalence) * (pt / (1 - pt))
+            rows.extend([
+                {"model_key": m, "model_name": model_name(m), "threshold_probability": float(pt), "strategy": "model", "net_benefit": float(nb)},
+                {"model_key": m, "model_name": model_name(m), "threshold_probability": float(pt), "strategy": "treat_all", "net_benefit": float(treat_all)},
+                {"model_key": m, "model_name": model_name(m), "threshold_probability": float(pt), "strategy": "treat_none", "net_benefit": 0.0},
+            ])
+    return pd.DataFrame(rows)
+
+
+def checkpoint_inventory(run_root: Path | None) -> pd.DataFrame:
+    rows = []
+    if run_root is None:
+        return pd.DataFrame(columns=["model_key", "model_name", "seed", "outer_fold", "path", "exists", "bytes", "sha256", "metadata_valid", "error"])
+    import torch
+    for m in EXPECTED_MODELS:
+        for seed in EXPECTED_SEEDS:
+            for fold in EXPECTED_FOLDS:
+                path = Path(run_root) / "trials" / m / f"seed_{seed}" / f"fold_{fold}" / "best_model_portable_fp16.pt"
+                record = {
+                    "model_key": m, "model_name": model_name(m), "seed": seed, "outer_fold": fold,
+                    "path": str(path), "exists": path.is_file(), "bytes": None, "sha256": None,
+                    "metadata_valid": False, "error": "",
+                }
+                if path.is_file():
+                    try:
+                        record["bytes"] = int(path.stat().st_size)
+                        record["sha256"] = sha256_file(path)
+                        payload = torch.load(path, map_location="cpu", weights_only=False)
+                        ok = (
+                            str(payload.get("model_key")) == m
+                            and int(payload.get("seed")) == seed
+                            and int(payload.get("fold")) == fold - 1
+                            and isinstance(payload.get("state_dict"), dict)
+                        )
+                        record["metadata_valid"] = bool(ok)
+                        if not ok:
+                            record["error"] = "checkpoint metadata mismatch"
+                        del payload
+                    except Exception as exc:
+                        record["error"] = f"{type(exc).__name__}: {exc}"
+                
