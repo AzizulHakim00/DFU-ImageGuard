@@ -1,0 +1,161 @@
+("Primary final verification does not contain 45 completed trials")
+    if int(final.get("prediction_rows", -1)) != EXPECTED_OOF_ROWS:
+        raise RuntimeError("Primary final verification prediction row count changed")
+    if str(final.get("locked_split_sha256")) != EXPECTED_LOCKED_SPLIT_SHA256:
+        raise RuntimeError("Locked split SHA256 changed")
+    if len(met) != EXPECTED_TRIALS:
+        raise RuntimeError(f"fold_seed_metrics has {len(met)} rows, expected {EXPECTED_TRIALS}")
+    if len(oof) != EXPECTED_OOF_ROWS:
+        raise RuntimeError(f"OOF has {len(oof)} rows, expected {EXPECTED_OOF_ROWS}")
+
+    for col in ("model_key", "seed", "outer_fold", "image_id", "group_id", "label", "pred", "prob_raw", "prob_calibrated"):
+        if col not in oof.columns:
+            raise RuntimeError(f"OOF missing required column {col}")
+    for col in ("model_key", "seed", "outer_fold"):
+        if col not in met.columns:
+            raise RuntimeError(f"Metrics missing required column {col}")
+
+    oof["model_key"] = oof["model_key"].astype(str)
+    oof["seed"] = pd.to_numeric(oof["seed"], errors="raise").astype(int)
+    oof["outer_fold"] = pd.to_numeric(oof["outer_fold"], errors="raise").astype(int)
+    oof["label"] = pd.to_numeric(oof["label"], errors="raise").astype(int)
+    oof["pred"] = pd.to_numeric(oof["pred"], errors="raise").astype(int)
+    oof["image_id"] = oof["image_id"].astype(str)
+    oof["group_id"] = oof["group_id"].astype(str)
+
+    if set(oof["model_key"].unique()) != set(EXPECTED_MODELS):
+        raise RuntimeError(f"Unexpected model set: {sorted(oof['model_key'].unique())}")
+    if set(oof["seed"].unique()) != set(EXPECTED_SEEDS):
+        raise RuntimeError(f"Unexpected seed set: {sorted(oof['seed'].unique())}")
+    if set(oof["outer_fold"].unique()) != set(EXPECTED_FOLDS):
+        raise RuntimeError(f"Unexpected fold set: {sorted(oof['outer_fold'].unique())}")
+    if not set(oof["label"].unique()).issubset({0, 1}) or not set(oof["pred"].unique()).issubset({0, 1}):
+        raise RuntimeError("Binary label/prediction domain violation")
+    for col in ("prob_raw", "prob_calibrated"):
+        vals = pd.to_numeric(oof[col], errors="coerce").to_numpy(float)
+        if not np.isfinite(vals).all() or (vals < 0).any() or (vals > 1).any():
+            raise RuntimeError(f"Invalid probability values in {col}")
+
+    dup = oof.duplicated(["model_key", "seed", "image_id"], keep=False)
+    if dup.any():
+        raise RuntimeError("Duplicate model-seed-image OOF prediction rows detected")
+
+    counts = oof.groupby(["model_key", "seed"]).agg(rows=("image_id", "size"), unique_images=("image_id", "nunique"))
+    if not ((counts["rows"] == EXPECTED_UNIQUE_IMAGES) & (counts["unique_images"] == EXPECTED_UNIQUE_IMAGES)).all():
+        raise RuntimeError("Not every model-seed contains exactly 1055 unique images")
+
+    image_meta = oof[["image_id", "group_id", "label", "outer_fold"] + (["relative_path"] if "relative_path" in oof.columns else [])].copy()
+    consistency_cols = [c for c in image_meta.columns if c != "image_id"]
+    for col in consistency_cols:
+        n = image_meta.groupby("image_id")[col].nunique(dropna=False)
+        if (n > 1).any():
+            raise RuntimeError(f"Historical OOF metadata inconsistent by image_id for {col}")
+    unique_images = image_meta.drop_duplicates("image_id").reset_index(drop=True)
+    if len(unique_images) != EXPECTED_UNIQUE_IMAGES:
+        raise RuntimeError(f"Unique image count {len(unique_images)} != {EXPECTED_UNIQUE_IMAGES}")
+    fold_sizes = unique_images.groupby("outer_fold").size().sort_index().to_dict()
+    if fold_sizes != EXPECTED_FOLD_SIZES:
+        raise RuntimeError(f"Fold sizes changed: {fold_sizes}")
+    if unique_images.groupby("group_id")["outer_fold"].nunique().max() != 1:
+        raise RuntimeError("Similarity group crosses outer folds in frozen primary experiment")
+
+    rec_id = rec[["model_key", "seed", "outer_fold"]].drop_duplicates()
+    if len(rec_id) != EXPECTED_TRIALS:
+        raise RuntimeError("Reconciliation does not contain 45 unique identities")
+
+    proof = {
+        "status": "PASS",
+        "version": VERSION,
+        "input_zip": str(input_zip),
+        "input_zip_sha256": sha256_file(input_zip),
+        "completed_unique_trials": EXPECTED_TRIALS,
+        "oof_rows": EXPECTED_OOF_ROWS,
+        "unique_images": EXPECTED_UNIQUE_IMAGES,
+        "models": sorted(EXPECTED_MODELS),
+        "seeds": list(EXPECTED_SEEDS),
+        "fold_sizes": {str(k): int(v) for k, v in fold_sizes.items()},
+        "locked_split_sha256": EXPECTED_LOCKED_SPLIT_SHA256,
+        "wrong_image_to_fold_assignments": 0,
+        "cross_fold_similarity_group_leakage": 0,
+        "verified_at_ns": now_ns(),
+    }
+    print("PHASE2 integrity gate: PASS | 45 trials | 9495 OOF | 1055 images | frozen fold/group membership")
+    return unique_images, proof
+
+
+def metric_dict(y: np.ndarray, p: np.ndarray, pred: np.ndarray) -> dict[str, float]:
+    from sklearn.metrics import (
+        accuracy_score,
+        balanced_accuracy_score,
+        brier_score_loss,
+        f1_score,
+        log_loss,
+        matthews_corrcoef,
+        precision_score,
+        average_precision_score,
+        roc_auc_score,
+        confusion_matrix,
+    )
+    y = np.asarray(y, dtype=int)
+    p = np.asarray(p, dtype=float)
+    pred = np.asarray(pred, dtype=int)
+    tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+    eps = 1e-12
+    ece = expected_calibration_error(y, p, bins=15)
+    return {
+        "accuracy": float(accuracy_score(y, pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+        "sensitivity": float(tp / max(tp + fn, 1)),
+        "specificity": float(tn / max(tn + fp, 1)),
+        "precision": float(precision_score(y, pred, zero_division=0)),
+        "f1": float(f1_score(y, pred, zero_division=0)),
+        "mcc": float(matthews_corrcoef(y, pred)),
+        "roc_auc": float(roc_auc_score(y, p)) if len(np.unique(y)) == 2 else float("nan"),
+        "pr_auc": float(average_precision_score(y, p)) if len(np.unique(y)) == 2 else float("nan"),
+        "brier": float(brier_score_loss(y, p)),
+        "log_loss": float(log_loss(y, np.clip(p, eps, 1 - eps), labels=[0, 1])),
+        "ece": float(ece),
+        "tp": int(tp), "tn": int(tn), "fp": int(fp), "fn": int(fn), "n": int(len(y)),
+    }
+
+
+def expected_calibration_error(y: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
+    y = np.asarray(y, dtype=int)
+    p = np.asarray(p, dtype=float)
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    idx = np.clip(np.digitize(p, edges[1:-1], right=True), 0, bins - 1)
+    total = len(y)
+    ece = 0.0
+    for b in range(bins):
+        mask = idx == b
+        if not mask.any():
+            continue
+        ece += (mask.sum() / total) * abs(float(p[mask].mean()) - float(y[mask].mean()))
+    return float(ece)
+
+
+def calibration_curve_equal_frequency(y: np.ndarray, p: np.ndarray, bins: int = 10) -> pd.DataFrame:
+    frame = pd.DataFrame({"y": np.asarray(y, int), "p": np.asarray(p, float)}).sort_values("p", kind="stable").reset_index(drop=True)
+    q = min(bins, len(frame))
+    frame["bin"] = pd.qcut(np.arange(len(frame)), q=q, labels=False, duplicates="drop")
+    out = frame.groupby("bin", as_index=False).agg(
+        n=("y", "size"),
+        mean_probability=("p", "mean"),
+        observed_rate=("y", "mean"),
+    )
+    return out
+
+
+def primary_performance(metrics: pd.DataFrame) -> pd.DataFrame:
+    metrics = metrics.copy()
+    metric_cols = [
+        "accuracy", "balanced_accuracy", "sensitivity", "specificity", "precision", "f1", "mcc",
+        "roc_auc", "pr_auc", "brier", "log_loss", "ece",
+    ]
+    rows = []
+    for key in EXPECTED_MODELS:
+        g = metrics.loc[metrics["model_key"] == key]
+        row: dict[str, Any] = {"model_key": key, "model_name": model_name(key), "n_fold_seed_trials": int(len(g))}
+        for m in metric_cols:
+            vals = pd.to_numeric(g[m], errors="raise").to_numpy(float)
+          
