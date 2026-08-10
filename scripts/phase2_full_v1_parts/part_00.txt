@@ -1,0 +1,227 @@
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import math
+import os
+import pickle
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+from typing import Any, Iterable
+
+import numpy as np
+import pandas as pd
+
+VERSION = "DFU_PHASE2_TRUSTWORTHINESS_FULL_V1_20260811"
+RUN_ID = "RELIABLE_DFU_CV_V3_MISSING38"
+EXPECTED_TRIALS = 45
+EXPECTED_OOF_ROWS = 9495
+EXPECTED_UNIQUE_IMAGES = 1055
+EXPECTED_MODELS = ("convnextv2_tiny", "densenet121", "mobilenetv3_large")
+EXPECTED_SEEDS = (2026, 2027, 2028)
+EXPECTED_FOLDS = (1, 2, 3, 4, 5)
+EXPECTED_FOLD_SIZES = {1: 209, 2: 206, 3: 217, 4: 214, 5: 209}
+EXPECTED_LOCKED_SPLIT_SHA256 = "d392c8dd1458b5054a74ceafdc2d63ad88e5f39bceec2558338a0980170c2eb1"
+EXPECTED_INPUT_NAME = "DFU_REPAIR45_FINAL_EXPORT.zip"
+PHASE2_DIRNAME = "PHASE2_FULL"
+BOOTSTRAP_REPS = 1000
+LEAKAGE_SIM_REPS = 1000
+RNG_SEED = 2026
+TARGET_SENSITIVITY = 0.95
+REFERRAL_RATES = (0.00, 0.05, 0.10, 0.15, 0.20)
+COVERAGES = tuple(1.0 - r for r in REFERRAL_RATES)
+XAI_CASE_TYPES = (
+    "confident_true_positive",
+    "confident_true_negative",
+    "persistent_false_negative",
+    "persistent_false_positive",
+    "uncertain_dfu",
+    "uncertain_normal",
+)
+FORBIDDEN_CALL_NAMES = ("train_trial", "train_model", "make_outer_folds", "assign_duplicate_groups")
+
+MODEL_NAMES = {
+    "convnextv2_tiny": "ConvNeXtV2-Tiny",
+    "densenet121": "DenseNet121",
+    "mobilenetv3_large": "MobileNetV3-Large",
+}
+MODEL_CANDIDATES = {
+    "convnextv2_tiny": (
+        "convnextv2_tiny.fcmae_ft_in22k_in1k",
+        "convnextv2_tiny.fcmae_ft_in1k",
+        "convnextv2_tiny.fcmae",
+    ),
+    "densenet121": ("densenet121.ra_in1k", "densenet121"),
+    "mobilenetv3_large": ("mobilenetv3_large_100.ra_in1k", "mobilenetv3_large_100"),
+}
+
+
+def now_ns() -> int:
+    return time.time_ns()
+
+
+def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def atomic_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def atomic_csv(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    raise TypeError(type(value).__name__)
+
+
+def model_name(key: str) -> str:
+    return MODEL_NAMES.get(str(key), str(key))
+
+
+def ensure_packages(packages: dict[str, str]) -> None:
+    import importlib.util
+    missing = [pip_name for import_name, pip_name in packages.items() if importlib.util.find_spec(import_name) is None]
+    if missing:
+        print("Installing Phase-2 analysis dependencies only:", ", ".join(missing))
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
+
+
+def configure_matplotlib() -> None:
+    import matplotlib as mpl
+    mpl.rcParams.update({
+        "figure.dpi": 120,
+        "savefig.dpi": 400,
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.labelsize": 11,
+        "legend.fontsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.constrained_layout.use": True,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    })
+
+
+def save_figure(fig, png_dir: Path, pdf_dir: Path, stem: str) -> None:
+    png_dir.mkdir(parents=True, exist_ok=True)
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png_dir / f"{stem}.png", bbox_inches="tight", dpi=400)
+    fig.savefig(pdf_dir / f"{stem}.pdf", bbox_inches="tight")
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def snapshot_trial_tree(run_root: Path | None) -> dict[str, tuple[int, int]]:
+    if run_root is None:
+        return {}
+    trials = Path(run_root) / "trials"
+    if not trials.exists():
+        return {}
+    snap: dict[str, tuple[int, int]] = {}
+    for p in sorted(trials.rglob("*")):
+        if p.is_file():
+            st = p.stat()
+            snap[str(p.relative_to(trials))] = (int(st.st_size), int(st.st_mtime_ns))
+    return snap
+
+
+def static_self_audit() -> dict[str, Any]:
+    import ast
+    source_path = Path(__file__) if "__file__" in globals() else None
+    text = source_path.read_text(encoding="utf-8") if source_path and source_path.exists() else ""
+    tree = ast.parse(text) if text else ast.parse("")
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id in FORBIDDEN_CALL_NAMES:
+            found.append(func.id)
+        elif isinstance(func, ast.Attribute):
+            if func.attr in FORBIDDEN_CALL_NAMES:
+                found.append(func.attr)
+            if func.attr == "step" and isinstance(func.value, ast.Name) and func.value.id == "optimizer":
+                found.append("optimizer.step")
+    found = sorted(set(found))
+    if found:
+        raise RuntimeError(f"Phase-2 source contains forbidden training call(s): {found}")
+    return {
+        "status": "PASS",
+        "forbidden_training_calls_present": found,
+        "training_performed": False,
+        "outer_folds_regenerated": False,
+        "duplicate_groups_regenerated": False,
+    }
+
+
+def load_export_zip(zip_path: Path) -> dict[str, Any]:
+    required = {
+        "tables/REPAIR45_RECONCILIATION.csv",
+        "REPAIR45_FINAL_VERIFICATION.json",
+        "tables/fold_seed_metrics.csv",
+        "tables/all_oof_predictions.csv",
+        "tables/selective_prediction.csv",
+        "tables/error_audit.csv",
+        "reliable_dfu_reproducibility_repair45.pkl",
+    }
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = set(zf.namelist())
+        missing = sorted(required - names)
+        if missing:
+            raise RuntimeError(f"Final export missing required members: {missing}")
+        frames = {
+            "reconciliation": pd.read_csv(io.BytesIO(zf.read("tables/REPAIR45_RECONCILIATION.csv"))),
+            "metrics": pd.read_csv(io.BytesIO(zf.read("tables/fold_seed_metrics.csv"))),
+            "oof": pd.read_csv(io.BytesIO(zf.read("tables/all_oof_predictions.csv"))),
+            "selective_original": pd.read_csv(io.BytesIO(zf.read("tables/selective_prediction.csv"))),
+            "error_original": pd.read_csv(io.BytesIO(zf.read("tables/error_audit.csv"))),
+            "final_verification": json.loads(zf.read("REPAIR45_FINAL_VERIFICATION.json").decode("utf-8")),
+            "original_pkl_bytes": zf.read("reliable_dfu_reproducibility_repair45.pkl"),
+        }
+        if "tables/paired_bootstrap.json" in names:
+            frames["old_paired_bootstrap"] = json.loads(zf.read("tables/paired_bootstrap.json").decode("utf-8"))
+        else:
+            frames["old_paired_bootstrap"] = None
+    return frames
+
+
+def integrity_gate(data: dict[str, Any], input_zip: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    rec = data["reconciliation"].copy()
+    met = data["metrics"].copy()
+    oof = data["oof"].copy()
+    final = data["final_verification"]
+
+    if final.get("status") != "PASS":
+        raise RuntimeError(f"Primary final verification is not PASS: {final.get('status')}")
+    if int(final.get("completed_unique_trials", -1)) != EXPECTED_TRIALS:
+        raise RuntimeError
