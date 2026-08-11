@@ -1,0 +1,242 @@
+def configure_plotting() -> None:
+    import matplotlib as mpl
+    mpl.rcParams.update({
+        "figure.dpi": 120, "savefig.dpi": 350,
+        "font.size": 10, "axes.titlesize": 12, "axes.labelsize": 10,
+        "legend.fontsize": 9, "xtick.labelsize": 9, "ytick.labelsize": 9,
+        "axes.spines.top": False, "axes.spines.right": False,
+        "pdf.fonttype": 42, "ps.fonttype": 42,
+    })
+
+
+def save_fig(fig, out_root: Path, stem: str) -> None:
+    png = out_root / "figures_png" / f"{stem}.png"
+    pdf = out_root / "figures_pdf" / f"{stem}.pdf"
+    png.parent.mkdir(parents=True, exist_ok=True)
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(png, bbox_inches="tight", dpi=350)
+    fig.savefig(pdf, bbox_inches="tight")
+
+
+def make_figures(ext_eval: pd.DataFrame, overlap_summary: pd.DataFrame, ens: pd.DataFrame, extm: pd.DataFrame, ive: pd.DataFrame, referral: pd.DataFrame, out_root: Path) -> None:
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import roc_curve, precision_recall_curve
+    from sklearn.calibration import calibration_curve
+    from sklearn.metrics import confusion_matrix
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    counts = ext_eval.label.value_counts().sort_index()
+    ax.bar(["Normal", "Diabetic Wound"], [counts.get(0, 0), counts.get(1, 0)])
+    ax.set_ylabel("Images")
+    ax.set_title("External Evaluation Class Distribution")
+    save_fig(fig, out_root, "FigP4V2_01_External_Class_Distribution")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    s = overlap_summary.iloc[0]
+    vals = [int(s["exact_primary_overlap"]), int(s["near_primary_candidates_phash_le_4"]), int(s["external_eval_images_after_exact_exclusion"])]
+    ax.bar(["Exact overlap", "Near candidates", "Retained"], vals)
+    ax.set_ylabel("Images")
+    ax.set_title("Cross-Dataset Similarity Audit")
+    save_fig(fig, out_root, "FigP4V2_02_Cross_Dataset_Overlap")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for model_key, g in ens.groupby("model_key"):
+        fpr, tpr, _ = roc_curve(g.label, g.prob_calibrated_mean)
+        auc = extm.loc[extm.model_key == model_key, "roc_auc"].iloc[0]
+        ax.plot(fpr, tpr, label=f"{MODEL_NAMES[model_key]} AUC={auc:.3f}")
+    ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1)
+    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+    ax.set_title("External ROC Curves"); ax.legend()
+    save_fig(fig, out_root, "FigP4V2_03_External_ROC")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for model_key, g in ens.groupby("model_key"):
+        pr, rc, _ = precision_recall_curve(g.label, g.prob_calibrated_mean)
+        ap = extm.loc[extm.model_key == model_key, "pr_auc"].iloc[0]
+        ax.plot(rc, pr, label=f"{MODEL_NAMES[model_key]} AP={ap:.3f}")
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+    ax.set_title("External Precision-Recall Curves"); ax.legend()
+    save_fig(fig, out_root, "FigP4V2_04_External_PR")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for model_key, g in ens.groupby("model_key"):
+        frac, mean = calibration_curve(g.label, g.prob_calibrated_mean, n_bins=10, strategy="quantile")
+        ax.plot(mean, frac, marker="o", label=MODEL_NAMES[model_key])
+    ax.plot([0, 1], [0, 1], linestyle="--", linewidth=1)
+    ax.set_xlabel("Mean predicted probability"); ax.set_ylabel("Observed positive fraction")
+    ax.set_title("External Reliability Diagram"); ax.legend()
+    save_fig(fig, out_root, "FigP4V2_05_External_Reliability")
+    plt.close(fig)
+
+    selected = ive[ive.metric.isin(["accuracy", "sensitivity", "specificity", "roc_auc", "brier", "ece"])].copy()
+    if not selected.empty:
+        pivot_i = selected.pivot(index="metric", columns="model_name", values="internal_macro_mean")
+        pivot_e = selected.pivot(index="metric", columns="model_name", values="external_ensemble")
+        metrics = list(pivot_i.index)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = np.arange(len(metrics)); width = 0.12
+        names = list(pivot_i.columns)
+        for j, name in enumerate(names):
+            ax.bar(x + (j * 2) * width, pivot_i[name].values, width, label=f"{name} internal")
+            ax.bar(x + (j * 2 + 1) * width, pivot_e[name].values, width, label=f"{name} external")
+        ax.set_xticks(x + width * (len(names) - 0.5)); ax.set_xticklabels(metrics, rotation=30, ha="right")
+        ax.set_title("Internal vs External Performance")
+        ax.legend(ncol=2, fontsize=8)
+        save_fig(fig, out_root, "FigP4V2_06_Internal_vs_External")
+        plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    for model_key, g in referral.groupby("model_key"):
+        ax.plot(g.coverage, g.accuracy, marker="o", label=MODEL_NAMES[model_key])
+    ax.set_xlabel("Coverage"); ax.set_ylabel("Accuracy after referral")
+    ax.set_title("External Risk-Coverage")
+    ax.legend()
+    save_fig(fig, out_root, "FigP4V2_07_External_Risk_Coverage")
+    plt.close(fig)
+
+    models = list(MODEL_NAMES)
+    fig, axes = plt.subplots(1, len(models), figsize=(12, 3.6))
+    for ax, model_key in zip(axes, models):
+        g = ens[ens.model_key == model_key]
+        cm = confusion_matrix(g.label, g.pred_majority, labels=[0, 1])
+        ax.imshow(cm)
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+        ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+        ax.set_xticklabels(["Normal", "DFU"]); ax.set_yticklabels(["Normal", "DFU"])
+        ax.set_title(MODEL_NAMES[model_key])
+        ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+    fig.suptitle("External Frozen-Decision Confusion Matrices")
+    save_fig(fig, out_root, "FigP4V2_08_External_Confusion_Matrices")
+    plt.close(fig)
+
+
+def display_results(out_root: Path) -> None:
+    from IPython.display import display, Markdown, Image as IPImage
+    tables = [
+        ("DATASET AUDIT", "01_dataset_audit.csv"),
+        ("CROSS-DATASET OVERLAP SUMMARY", "02_cross_dataset_overlap_summary.csv"),
+        ("CHECKPOINT PROTOCOL", "03_checkpoint_protocol.csv"),
+        ("EXTERNAL CHECKPOINT METRICS", "05_external_checkpoint_metrics.csv"),
+        ("EXTERNAL ENSEMBLE METRICS", "07_external_ensemble_metrics.csv"),
+        ("INTERNAL VS EXTERNAL", "08_internal_vs_external.csv"),
+        ("GROUP-CLUSTER BOOTSTRAP CI", "09_external_bootstrap_ci.csv"),
+        ("SELECTIVE REFERRAL", "10_external_selective_referral.csv"),
+    ]
+    print("\n" + "=" * 100)
+    print("PHASE-4 V2 RESULT SUMMARY")
+    print("=" * 100)
+    for title, name in tables:
+        p = out_root / "tables" / name
+        if p.exists():
+            display(Markdown(f"## {title}"))
+            display(pd.read_csv(p))
+    pngs = sorted((out_root / "figures_png").glob("*.png"))
+    for p in pngs:
+        display(Markdown(f"### {p.stem}"))
+        display(IPImage(filename=str(p), width=1000))
+
+
+def export_final(out_root: Path, verification: dict[str, Any]) -> Path:
+    atomic_json(out_root / "PHASE4_EXTERNAL_V2_VERIFICATION.json", verification)
+    pkl_path = out_root / "PHASE4_EXTERNAL_V2_ANALYSIS.pkl"
+    with pkl_path.open("wb") as f:
+        pickle.dump(verification, f, protocol=pickle.HIGHEST_PROTOCOL)
+    zip_path = out_root / "PHASE4_EXTERNAL_V2_FINAL_EXPORT.zip"
+    wanted = []
+    for sub in ["tables", "figures_png", "figures_pdf", "checkpoint_predictions"]:
+        root = out_root / sub
+        if root.exists():
+            wanted.extend([p for p in root.rglob("*") if p.is_file()])
+    wanted.extend([out_root / "PHASE4_EXTERNAL_V2_VERIFICATION.json", pkl_path])
+    tmp = zip_path.with_suffix(".zip.tmp")
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for p in wanted:
+            if p.exists():
+                zf.write(p, arcname=str(p.relative_to(out_root)))
+    os.replace(tmp, zip_path)
+    return zip_path
+
+
+def run() -> None:
+    random.seed(RNG_SEED); np.random.seed(RNG_SEED)
+    env = detect_environment()
+    ensure_packages()
+    mount_drive_if_colab(env)
+    paths = configure_paths(env)
+    out_root = paths["out_root"]
+    out_root.mkdir(parents=True, exist_ok=True)
+    configure_plotting()
+
+    print("=" * 100)
+    print(VERSION)
+    print("ENVIRONMENT:", env)
+    print("URL-ONLY PUBLIC DATASETS | FROZEN MODELS | NO TRAINING | NO FINE-TUNING")
+    print("Overlap audit is CPU/I/O by design and is cached. Model inference is GPU-required.")
+    print("Output root:", out_root)
+    print("=" * 100, flush=True)
+
+    frozen = resolve_frozen_inputs(env, paths)
+    verify_frozen_inputs(frozen)
+    inv = frozen["inventory"].copy().sort_values(["model_key", "seed", "outer_fold"]).reset_index(drop=True)
+    oof = frozen["oof"].copy()
+    fold_metrics = frozen["metrics"].copy()
+
+    protocol_rows = []
+    for _, r in inv.iterrows():
+        temp, thr = get_frozen_operating_point(oof, str(r.model_key), int(r.seed), int(r.outer_fold))
+        protocol_rows.append({
+            "model_key": str(r.model_key), "model_name": MODEL_NAMES[str(r.model_key)],
+            "seed": int(r.seed), "outer_fold": int(r.outer_fold),
+            "checkpoint_sha256": str(r.sha256), "temperature_frozen": temp, "threshold_frozen": thr,
+            "external_label_fitting": False, "training": False, "fine_tuning": False,
+        })
+    protocol = pd.DataFrame(protocol_rows)
+    atomic_csv(out_root / "tables" / "03_checkpoint_protocol.csv", protocol)
+
+    print("Fetching external dataset via URL/API:", EXTERNAL_DATASET_HANDLE, flush=True)
+    ext_root = download_dataset(EXTERNAL_DATASET_HANDLE)
+    external = discover_external_dataset(ext_root)
+    audit = pd.DataFrame([{
+        "dataset_handle": EXTERNAL_DATASET_HANDLE,
+        "selected_images": len(external),
+        "positive_images": int((external.label == 1).sum()),
+        "negative_images": int((external.label == 0).sum()),
+        "task": "independent diabetic-wound-vs-normal domain-shift stress test",
+        "manual_download_required": False,
+    }])
+    atomic_csv(out_root / "tables" / "01_dataset_audit.csv", audit)
+
+    print("Fetching primary dataset via URL/API for overlap audit:", PRIMARY_DATASET_HANDLE, flush=True)
+    primary_root = download_dataset(PRIMARY_DATASET_HANDLE)
+    primary_unique = oof[["image_id", "relative_path"]].drop_duplicates("image_id").copy()
+    primary_unique["path"] = primary_unique.relative_path.map(lambda x: str(resolve_primary_image_path(primary_root, x)))
+    ext_fp = build_fingerprints(external, out_root / "cache" / "external_fingerprints.csv", "relative_path", workers=12)
+    primary_fp = build_fingerprints(primary_unique.rename(columns={"image_id": "primary_key"}), out_root / "cache" / "primary_fingerprints.csv", "primary_key", workers=12)
+    overlap_summary, overlap_details = audit_overlap(external, ext_fp, primary_fp, out_root)
+
+    clustered = assign_external_similarity_clusters(overlap_details)
+    ext_eval = external.merge(clustered[["relative_path", "external_group_id"]], on="relative_path", how="inner")
+    if ext_eval.label.nunique() != 2:
+        raise RuntimeError("External evaluation set lost one class after overlap exclusion")
+    print("External evaluation images:", len(ext_eval), "groups:", ext_eval.external_group_id.nunique(), flush=True)
+
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA GPU not available. CPU overlap audit has been cached, but frozen model inference is intentionally blocked. "
+            "Enable a Kaggle/Colab GPU accelerator and rerun; the audit will be RESTORED."
+        )
+    device = torch.device("cuda")
+    print("Inference device: cuda", flush=True)
+    print("GPU:", torch.cuda.get_device_name(0), flush=True)
+
+    prediction_frames = []
+    total_ckpt = len(inv)
+    for i, (_, r) in enumerate(inv.iterrows(), start=1):
+        print(f"Checkpoint {i}/{total_ckpt}", flush=True)
