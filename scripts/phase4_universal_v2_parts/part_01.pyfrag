@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import pickle
+import random
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+VERSION = "DFU_PHASE4_UNIVERSAL_KAGGLE_COLAB_V2_20260812"
+RUN_ID = "RELIABLE_DFU_CV_V3_MISSING38"
+EXTERNAL_DATASET_HANDLE = "ibrahimfateen/wound-classification"
+PRIMARY_DATASET_HANDLE = "laithjj/diabetic-foot-ulcer-dfu"
+EXPECTED_CHECKPOINTS = 7
+RNG_SEED = 2026
+IMAGE_SIZE = 224
+BATCH_SIZE = 64
+PHASH_NEAR_THRESHOLD = 4
+BOOTSTRAP_REPS = 1000
+MODEL_NAMES = {
+    "convnextv2_tiny": "ConvNeXtV2-Tiny",
+    "densenet121": "DenseNet121",
+    "mobilenetv3_large": "MobileNetV3-Large",
+}
+MODEL_CANDIDATES = {
+    "convnextv2_tiny": (
+        "convnextv2_tiny.fcmae_ft_in22k_in1k",
+        "convnextv2_tiny.fcmae_ft_in1k",
+        "convnextv2_tiny.fcmae",
+    ),
+    "densenet121": ("densenet121.ra_in1k", "densenet121"),
+    "mobilenetv3_large": ("mobilenetv3_large_100.ra_in1k", "mobilenetv3_large_100"),
+}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+
+def sha256_file(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for b in iter(lambda: f.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def atomic_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def atomic_csv(path: Path, df: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def detect_environment() -> str:
+    if Path("/kaggle").exists() or os.environ.get("KAGGLE_KERNEL_RUN_TYPE"):
+        return "kaggle"
+    try:
+        import google.colab  # noqa: F401
+        return "colab"
+    except Exception:
+        return "local"
+
+
+def ensure_packages() -> None:
+    import importlib.util
+    packages = {
+        "timm": "timm>=1.0.15",
+        "kagglehub": "kagglehub>=0.3.0",
+        "PIL": "pillow>=10.0.0",
+        "sklearn": "scikit-learn>=1.4.0",
+        "matplotlib": "matplotlib>=3.8.0",
+    }
+    missing = [pip for mod, pip in packages.items() if importlib.util.find_spec(mod) is None]
+    if missing:
+        print("Installing Phase-4 dependencies:", ", ".join(missing), flush=True)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *missing])
+
+
+def mount_drive_if_colab(env: str) -> None:
+    if env != "colab":
+        return
+    if Path("/content/drive/MyDrive").is_dir():
+        return
+    from google.colab import drive
+    drive.mount("/content/drive", force_remount=False)
+
+
+def configure_paths(env: str) -> dict[str, Path]:
+    if env == "colab":
+        base = Path("/content/drive/MyDrive/DFU-ImageGuard")
+        run_root = base / "runs" / RUN_ID
+        out_root = run_root / "PHASE4_EXTERNAL_V2"
+        return {"base": base, "run_root": run_root, "out_root": out_root}
+    if env == "kaggle":
+        base = Path("/kaggle/working/DFU-ImageGuard")
+        run_root = base / "runs" / RUN_ID
+        out_root = run_root / "PHASE4_EXTERNAL_V2"
+        return {"base": base, "run_root": run_root, "out_root": out_root}
+    base = Path.cwd() / "DFU-ImageGuard"
+    run_root = base / "runs" / RUN_ID
+    out_root = run_root / "PHASE4_EXTERNAL_V2"
+    return {"base": base, "run_root": run_root, "out_root": out_root}
+
+
+def find_bundle_root_under(search_root: Path) -> Path | None:
+    if not search_root.exists():
+        return None
+    manifests = sorted(search_root.rglob("FROZEN_INPUT_MANIFEST.json"))
+    valid = []
+    for p in manifests:
+        root = p.parent
+        if (root / "tables" / "14_checkpoint_inventory.csv").exists() and (root / "tables" / "all_oof_predictions.csv").exists():
+            valid.append(root)
+    if len(valid) == 1:
+        return valid[0]
+    if len(valid) > 1:
+        valid.sort(key=lambda r: (r / "FROZEN_INPUT_MANIFEST.json").stat().st_mtime, reverse=True)
+        print("Multiple frozen bundles found; using newest:", valid[0], flush=True)
+        return valid[0]
+    zips = sorted(search_root.rglob("DFU_PHASE4_FROZEN_INPUT.zip"))
+    if zips:
+        extract_root = Path("/kaggle/working/dfu_phase4_frozen_extracted") if Path("/kaggle").exists() else Path.cwd() / "dfu_phase4_frozen_extracted"
+        marker = extract_root / "FROZEN_INPUT_MANIFEST.json"
+        if not marker.exists():
+            if extract_root.exists():
+                shutil.rmtree(extract_root)
+            extract_root.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zips[0], "r") as zf:
+                zf.extractall(extract_root)
+        return extract_root if marker.exists() else None
+    return None
+
+
+def resolve_frozen_inputs(env: str, paths: dict[str, Path]) -> dict[str, Any]:
+    if env == "colab":
+        run_root = paths["run_root"]
+        phase2 = run_root / "PHASE2_FULL"
+        inv_path = phase2 / "tables" / "14_checkpoint_inventory.csv"
+        oof_path = run_root / "tables" / "all_oof_predictions.csv"
+        met_path = run_root / "tables" / "fold_seed_metrics.csv"
+        ver_path = phase2 / "PHASE2_FULL_VERIFICATION.json"
+        for p in [inv_path, oof_path, met_path, ver_path]:
+            if not p.exists():
+                raise FileNotFoundError(f"Required frozen input missing: {p}")
+        inv = pd.read_csv(inv_path)
+        usable = inv.loc[(inv["exists"] == True) & (inv["metadata_valid"] == True)].copy()
+        if len(usable) != EXPECTED_CHECKPOINTS:
+            raise RuntimeError(f"Expected {EXPECTED_CHECKPOINTS} verified checkpoints, found {len(usable)}")
+        return {
+            "mode": "drive",
+            "root": run_root,
+            "inventory": usable,
+            "oof": pd.read_csv(oof_path),
+            "metrics": pd.read_csv(met_path),
+            "verification": json.loads(ver_path.read_text(encoding="utf-8")),
+        }
+
+    if env == "kaggle":
+        bundle = find_bundle_root_under(Path("/kaggle/input"))
+        if bundle is None:
+            handle = os.environ.get("DFU_FROZEN_DATASET_HANDLE", "").strip()
+            if handle:
+                import kagglehub
+                print("Frozen input bundle not attached; fetching private Kaggle dataset:", handle, flush=True)
+                downloaded = Path(kagglehub.dataset_download(handle))
+                bundle = find_bundle_root_under(downloaded)
+        if bundle is None:
+            raise FileNotFoundError(
+                "Frozen DFU input bundle not found in /kaggle/input. "
+                "Attach the private dataset created by the DFU Phase-4 Kaggle Input Exporter, "
+                "or set environment variable DFU_FROZEN_DATASET_HANDLE='username/dataset-slug'."
+            )
+        manifest = json.loads((bundle / "FROZEN_INPUT_MANIFEST.json").read_text(encoding="utf-8"))
+        inv = pd.read_csv(bundle / "tables" / "14_checkpoint_inventory.csv")
+        if "bundle_relative_path" not in inv.columns:
+            raise RuntimeError("Frozen bundle inventory lacks bundle_relative_path")
+        inv["path"] = inv["bundle_relative_path"].map(lambda x: str(bundle / str(x)))
+        usable = inv.copy()
+        if len(usable) != EXPECTED_CHECKPOINTS:
+            raise RuntimeError(f"Expected {EXPECTED_CHECKPOINTS} bundle checkpoints, found {len(usable)}")
+        for _, r in usable.iterrows():
+            p = Path(r["path"])
+            if not p.exists():
+                raise FileNotFoundError(p)
+            if sha256_file(p) != str(r["sha256"]):
+                raise RuntimeError(f"Frozen checkpoint SHA mismatch: {p}")
+        return {
+            "mode": "bundle",
+            "root": bundle,
+            "inventory": usable,
+            "oof": pd.read_csv(bundle / "tables" / "all_oof_predictions.csv"),
+            "metrics": pd.read_csv(bundle / "tables" / "fold_seed_metrics.csv"),
+            "verification": manifest,
+        }
+
+    raise RuntimeError("Universal Phase-4 runner supports Kaggle or Colab for the full run")
+
+
+def verify_frozen_inputs(frozen: dict[str, Any]) -> None:
+    ver = frozen["verification"]
+    if isinstance(ver, dict) and ver.get("status") not in (None, "PASS"):
+        raise RuntimeError("Frozen verification status is not PASS")
+    inv = frozen["inventory"]
+    if set(inv["model_key"]) - set(MODEL_NAMES):
+        raise RuntimeError("Unexpected model key in checkpoint inventory")
+    for _, r in inv.iterrows():
+        p = Path(r["path"])
+        if not p.exists():
+            raise FileNotFoundError(p)
+        actual = sha256_file(p)
+        if actual != str(r["sha256"]):
+            raise RuntimeError(f"Checkpoint SHA mismatch: {p}\nexpected={r['sha256']}\nactual={actual}")
+
+
+def download_dataset(handle: str) -> Path:
+    import kagglehub
+    root = Path(kagglehub.dataset_download(handle))
+    if not root.exists():
+        raise FileNotFoundError(root)
+    return root
+
+
+def normalize_component(text: str) -> str:
+    return " ".join(text.lower().replace("_", " ").replace("-", " ").split())
+
+
+def classify_external_path(path: Path, root: Path) -> int | None:
+    parts = [normalize_component(x) for x in path.relative_to(root).parts[:-1]]
+    joined = " / ".join(parts)
+    positive_tokens = ["diabetic wounds", "diabetic wound", "diabetic foot", "diabeticfoot", "dfu"]
+    negative_tokens = ["normal", "healthy foot", "healthy feet", "healthy"]
+    if any(tok in joined for tok in positive_tokens):
+        return 1
+    if any(tok in joined for tok in negative_tokens):
+        return 0
+    return None
