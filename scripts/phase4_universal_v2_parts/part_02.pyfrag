@@ -1,0 +1,249 @@
+    if any(tok in joined for tok in negative_tokens):
+        return 0
+    return None
+
+
+def discover_external_dataset(root: Path) -> pd.DataFrame:
+    rows = []
+    class_dir_counts: dict[str, int] = {}
+    for p in root.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
+            continue
+        rel = p.relative_to(root)
+        parent = normalize_component(rel.parent.name)
+        class_dir_counts[parent] = class_dir_counts.get(parent, 0) + 1
+        y = classify_external_path(p, root)
+        if y is not None:
+            rows.append({"path": str(p), "relative_path": str(rel), "label": int(y), "class_dir": parent})
+    df = pd.DataFrame(rows)
+    if df.empty or set(df["label"].unique()) != {0, 1}:
+        top = sorted(class_dir_counts.items(), key=lambda kv: kv[1], reverse=True)[:30]
+        raise RuntimeError(
+            "Could not discover both external classes from directory names. "
+            f"Detected class directories (top counts): {top}"
+        )
+    df = df.drop_duplicates("path").reset_index(drop=True)
+    return df
+
+
+def resolve_primary_image_path(root: Path, relative_path: str) -> Path:
+    rel = Path(str(relative_path))
+    direct = root / rel
+    if direct.exists():
+        return direct
+    cands = []
+    parts = rel.parts
+    for p in root.rglob(rel.name):
+        if not p.is_file():
+            continue
+        pp = p.parts
+        if len(pp) >= len(parts) and tuple(pp[-len(parts):]) == tuple(parts):
+            cands.append(p)
+    if len(cands) == 1:
+        return cands[0]
+    if not cands:
+        cands = [p for p in root.rglob(rel.name) if p.is_file()]
+    if len(cands) != 1:
+        raise RuntimeError(f"Could not uniquely resolve primary image {relative_path}; candidates={len(cands)}")
+    return cands[0]
+
+
+def dhash64(path: Path) -> int:
+    from PIL import Image
+    with Image.open(path) as im:
+        g = im.convert("L").resize((9, 8))
+        a = np.asarray(g, dtype=np.uint8)
+    bits = a[:, 1:] > a[:, :-1]
+    value = 0
+    for bit in bits.flatten():
+        value = (value << 1) | int(bit)
+    return int(value)
+
+
+def fingerprint_one(path: str) -> tuple[str, str, int, int]:
+    p = Path(path)
+    return path, sha256_file(p), dhash64(p), int(p.stat().st_size)
+
+
+def build_fingerprints(df: pd.DataFrame, cache_path: Path, key_col: str, workers: int = 8) -> pd.DataFrame:
+    if cache_path.exists():
+        cached = pd.read_csv(cache_path)
+        expected = set(df[key_col].astype(str))
+        if {"key", "sha256", "phash64", "size"}.issubset(cached.columns) and set(cached["key"].astype(str)) == expected:
+            print("RESTORED fingerprint cache:", cache_path, flush=True)
+            return cached
+    workers = max(1, min(int(workers), os.cpu_count() or 2, 16))
+    print(f"Building fingerprints with {workers} CPU workers...", flush=True)
+    rows = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fingerprint_one, str(row["path"])): str(row[key_col]) for _, row in df.iterrows()}
+        done = 0
+        total = len(futs)
+        for fut in as_completed(futs):
+            key = futs[fut]
+            path, sha, ph, size = fut.result()
+            rows.append({"key": key, "path": path, "sha256": sha, "phash64": str(ph), "size": size})
+            done += 1
+            if done % 100 == 0 or done == total:
+                print(f"Fingerprint progress: {done}/{total}", flush=True)
+    out = pd.DataFrame(rows).sort_values("key").reset_index(drop=True)
+    atomic_csv(cache_path, out)
+    return out
+
+
+def hamming64(a: int, b: int) -> int:
+    return int((int(a) ^ int(b)).bit_count())
+
+
+class UnionFind:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+
+
+def audit_overlap(external: pd.DataFrame, ext_fp: pd.DataFrame, primary_fp: pd.DataFrame, out_root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ext = external.merge(ext_fp[["key", "sha256", "phash64"]], left_on="relative_path", right_on="key", how="left")
+    primary_sha = set(primary_fp["sha256"].astype(str))
+    ext["exact_primary_overlap"] = ext["sha256"].astype(str).isin(primary_sha)
+
+    p_hashes = [int(x) for x in primary_fp["phash64"].astype(str)]
+    near_dist = []
+    for idx, ph in enumerate(ext["phash64"].astype(str)):
+        v = int(ph)
+        best = 64
+        for pv in p_hashes:
+            d = hamming64(v, pv)
+            if d < best:
+                best = d
+                if best == 0:
+                    break
+        near_dist.append(best)
+        if (idx + 1) % 100 == 0 or idx + 1 == len(ext):
+            print(f"Cross-dataset pHash audit: {idx+1}/{len(ext)}", flush=True)
+    ext["min_primary_phash_distance"] = near_dist
+    ext["near_primary_candidate"] = ext["min_primary_phash_distance"] <= PHASH_NEAR_THRESHOLD
+    ext["included_for_external_eval"] = ~ext["exact_primary_overlap"]
+
+    details = ext[[
+        "relative_path", "label", "class_dir", "sha256", "phash64",
+        "exact_primary_overlap", "min_primary_phash_distance", "near_primary_candidate",
+        "included_for_external_eval"
+    ]].copy()
+    summary = pd.DataFrame([{
+        "external_selected_images": len(ext),
+        "external_positive": int((ext.label == 1).sum()),
+        "external_negative": int((ext.label == 0).sum()),
+        "exact_primary_overlap": int(ext.exact_primary_overlap.sum()),
+        "near_primary_candidates_phash_le_4": int(ext.near_primary_candidate.sum()),
+        "external_eval_images_after_exact_exclusion": int(ext.included_for_external_eval.sum()),
+    }])
+    atomic_csv(out_root / "tables" / "02_cross_dataset_overlap_details.csv", details)
+    atomic_csv(out_root / "tables" / "02_cross_dataset_overlap_summary.csv", summary)
+    return summary, details
+
+
+def assign_external_similarity_clusters(details: pd.DataFrame) -> pd.DataFrame:
+    d = details.loc[details["included_for_external_eval"] == True].copy().reset_index(drop=True)
+    n = len(d)
+    uf = UnionFind(n)
+    ph = [int(x) for x in d["phash64"].astype(str)]
+    sha = d["sha256"].astype(str).tolist()
+    by_sha: dict[str, int] = {}
+    for i, s in enumerate(sha):
+        if s in by_sha:
+            uf.union(i, by_sha[s])
+        else:
+            by_sha[s] = i
+    for i in range(n):
+        for j in range(i + 1, n):
+            if hamming64(ph[i], ph[j]) <= PHASH_NEAR_THRESHOLD:
+                uf.union(i, j)
+    roots = [uf.find(i) for i in range(n)]
+    root_to_id: dict[int, str] = {}
+    ids = []
+    for r in roots:
+        if r not in root_to_id:
+            root_to_id[r] = f"EG{len(root_to_id)+1:05d}"
+        ids.append(root_to_id[r])
+    d["external_group_id"] = ids
+    return d
+
+
+def build_base_model(model_key: str):
+    import timm
+    errors = []
+    for name in MODEL_CANDIDATES[model_key]:
+        try:
+            return timm.create_model(name, pretrained=False, num_classes=1, drop_rate=0.20), name
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}: {e}")
+    raise RuntimeError(" | ".join(errors))
+
+
+def load_checkpoint_model(model_key: str, checkpoint: Path, device):
+    import torch
+    model, arch = build_base_model(model_key)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    state = payload.get("state_dict") or payload.get("model")
+    if state is None:
+        raise RuntimeError(f"No state_dict/model in {checkpoint}")
+    state = {k: (v.float() if torch.is_floating_point(v) else v) for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f"Checkpoint/model mismatch {model_key}: missing={missing[:5]} unexpected={unexpected[:5]}")
+    model.eval().to(device)
+    return model, arch
+
+
+def image_transform():
+    from torchvision import transforms
+    return transforms.Compose([
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+
+class ExternalDataset:
+    def __init__(self, frame: pd.DataFrame):
+        self.frame = frame.reset_index(drop=True)
+        self.tf = image_transform()
+    def __len__(self):
+        return len(self.frame)
+    def __getitem__(self, idx):
+        from PIL import Image
+        r = self.frame.iloc[idx]
+        with Image.open(r["path"]) as im:
+            x = self.tf(im.convert("RGB"))
+        return x, int(r["label"]), str(r["relative_path"]), str(r["external_group_id"])
+
+
+def sigmoid_np(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    out = np.empty_like(x)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    z = np.exp(x[~pos])
+    out[~pos] = z / (1.0 + z)
+    return out
+
+
+def get_frozen_operating_point(oof: pd.DataFrame, model_key: str, seed: int, outer_fold: int) -> tuple[float, float]:
+    g = oof[(oof["model_key"] == model_key) & (oof["seed"] == seed) & (oof["outer_fold"] == outer_fold)]
+    if g.empty:
+        raise RuntimeError(f"No OOF rows for {model_key} seed={seed} fold={outer_fold}")
+    temps = pd.Series(g["temperature"]).dropna().unique()
