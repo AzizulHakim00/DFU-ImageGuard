@@ -1,0 +1,63 @@
+        prediction_frames.append(run_checkpoint_inference(r, oof, ext_eval, device, out_root))
+        progress = {
+            "version": VERSION, "environment": env,
+            "completed_checkpoints": i, "total_checkpoints": total_ckpt,
+            "last_checkpoint": f"{r.model_key}_seed{int(r.seed)}_fold{int(r.outer_fold)}",
+            "updated_at_unix": time.time(),
+        }
+        atomic_json(out_root / "PHASE4_V2_PROGRESS.json", progress)
+
+    predictions = pd.concat(prediction_frames, ignore_index=True)
+    atomic_csv(out_root / "tables" / "04_external_checkpoint_predictions.csv", predictions)
+    ckpt_metrics = checkpoint_metrics(predictions)
+    atomic_csv(out_root / "tables" / "05_external_checkpoint_metrics.csv", ckpt_metrics)
+    ens = ensemble_predictions(predictions)
+    atomic_csv(out_root / "tables" / "06_external_ensemble_predictions.csv", ens)
+    extm = ensemble_metrics(ens)
+    atomic_csv(out_root / "tables" / "07_external_ensemble_metrics.csv", extm)
+    ive = internal_vs_external(fold_metrics, extm)
+    atomic_csv(out_root / "tables" / "08_internal_vs_external.csv", ive)
+    boot = cluster_bootstrap_ci(ens, reps=BOOTSTRAP_REPS)
+    atomic_csv(out_root / "tables" / "09_external_bootstrap_ci.csv", boot)
+    referral = selective_referral(ens)
+    atomic_csv(out_root / "tables" / "10_external_selective_referral.csv", referral)
+
+    make_figures(ext_eval, overlap_summary, ens, extm, ive, referral, out_root)
+
+    verification = {
+        "status": "PASS",
+        "version": VERSION,
+        "environment": env,
+        "primary_training_performed": False,
+        "fine_tuning_performed": False,
+        "external_label_fitting_for_threshold_or_temperature": False,
+        "public_datasets_acquired_by_url_api": True,
+        "external_dataset_handle": EXTERNAL_DATASET_HANDLE,
+        "primary_dataset_handle_for_overlap_audit": PRIMARY_DATASET_HANDLE,
+        "verified_checkpoints_used": int(len(inv)),
+        "external_selected_images": int(len(external)),
+        "external_eval_images": int(len(ext_eval)),
+        "external_similarity_groups": int(ext_eval.external_group_id.nunique()),
+        "exact_primary_overlap_excluded": int(overlap_summary.iloc[0].exact_primary_overlap),
+        "near_primary_candidates_phash_le_4": int(overlap_summary.iloc[0].near_primary_candidates_phash_le_4),
+        "bootstrap_reps": BOOTSTRAP_REPS,
+        "inference_device": str(device),
+        "gpu_name": torch.cuda.get_device_name(0),
+        "output_root": str(out_root),
+    }
+    zip_path = export_final(out_root, verification)
+    display_results(out_root)
+    print("\n" + "=" * 100)
+    print("PHASE-4 V2 EXTERNAL VERIFICATION: PASS")
+    print("Environment:", env)
+    print("Inference device: cuda")
+    print("GPU:", torch.cuda.get_device_name(0))
+    print("Primary training performed: FALSE")
+    print("Fine-tuning performed: FALSE")
+    print("External threshold/calibration fitting: FALSE")
+    print("Final export:", zip_path)
+    print("=" * 100)
+
+
+if __name__ == "__main__":
+    run()
