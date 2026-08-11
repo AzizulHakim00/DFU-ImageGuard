@@ -117,7 +117,6 @@ def audit_overlap(external: pd.DataFrame, ext_fp: pd.DataFrame, primary_fp: pd.D
     primary_sha = set(primary_fp["sha256"].astype(str))
     ext["exact_primary_overlap"] = ext["sha256"].astype(str).isin(primary_sha)
 
-    # Near-overlap search only after exact hash; vectorized enough for this dataset size.
     p_hashes = [int(x) for x in primary_fp["phash64"].astype(str)]
     near_dist = []
     for idx, ph in enumerate(ext["phash64"].astype(str)):
