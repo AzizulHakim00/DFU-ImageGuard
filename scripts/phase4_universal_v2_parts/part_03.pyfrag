@@ -1,0 +1,250 @@
+    thrs = pd.Series(g["threshold"]).dropna().unique()
+    if len(temps) != 1 or len(thrs) != 1:
+        raise RuntimeError(f"Non-unique frozen temperature/threshold for {model_key} seed={seed} fold={outer_fold}")
+    return float(temps[0]), float(thrs[0])
+
+
+def run_checkpoint_inference(
+    inv_row: pd.Series,
+    oof: pd.DataFrame,
+    ext_eval: pd.DataFrame,
+    device,
+    out_root: Path,
+) -> pd.DataFrame:
+    import torch
+    from torch.utils.data import DataLoader
+
+    model_key = str(inv_row["model_key"])
+    seed = int(inv_row["seed"])
+    fold = int(inv_row["outer_fold"])
+    ckpt = Path(inv_row["path"])
+    temperature, threshold = get_frozen_operating_point(oof, model_key, seed, fold)
+    cache = out_root / "checkpoint_predictions" / f"{model_key}_seed{seed}_fold{fold}.csv"
+    if cache.exists():
+        df = pd.read_csv(cache)
+        needed = {"relative_path", "label", "logit", "prob_raw", "prob_calibrated", "pred", "external_group_id"}
+        if needed.issubset(df.columns) and len(df) == len(ext_eval) and set(df.relative_path.astype(str)) == set(ext_eval.relative_path.astype(str)):
+            print(f"RESTORED checkpoint inference: {model_key} s{seed} f{fold}", flush=True)
+            return df
+
+    print(f"GPU INFERENCE START: {model_key} s{seed} f{fold}", flush=True)
+    model, arch = load_checkpoint_model(model_key, ckpt, device)
+    ds = ExternalDataset(ext_eval)
+    loader = DataLoader(
+        ds, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=min(4, os.cpu_count() or 2), pin_memory=True, persistent_workers=False
+    )
+    rows = []
+    with torch.inference_mode():
+        seen = 0
+        for xb, yb, rels, groups in loader:
+            xb = xb.to(device, non_blocking=True)
+            logits = model(xb).reshape(-1).float().detach().cpu().numpy()
+            praw = sigmoid_np(logits)
+            pcal = sigmoid_np(logits / max(temperature, 1e-8))
+            pred = (pcal >= threshold).astype(int)
+            for i in range(len(logits)):
+                rows.append({
+                    "model_key": model_key,
+                    "model_name": MODEL_NAMES[model_key],
+                    "seed": seed,
+                    "outer_fold": fold,
+                    "checkpoint_sha256": str(inv_row["sha256"]),
+                    "architecture": arch,
+                    "relative_path": str(rels[i]),
+                    "external_group_id": str(groups[i]),
+                    "label": int(yb[i]),
+                    "logit": float(logits[i]),
+                    "temperature": temperature,
+                    "threshold": threshold,
+                    "prob_raw": float(praw[i]),
+                    "prob_calibrated": float(pcal[i]),
+                    "pred": int(pred[i]),
+                })
+            seen += len(logits)
+            if seen % (BATCH_SIZE * 5) == 0 or seen == len(ds):
+                print(f"  {model_key} s{seed} f{fold}: {seen}/{len(ds)}", flush=True)
+    df = pd.DataFrame(rows)
+    atomic_csv(cache, df)
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"GPU INFERENCE PASS: {model_key} s{seed} f{fold}", flush=True)
+    return df
+
+
+def ece_score(y: np.ndarray, p: np.ndarray, bins: int = 15) -> float:
+    y = np.asarray(y).astype(int)
+    p = np.asarray(p, dtype=float)
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    ece = 0.0
+    for i in range(bins):
+        if i == bins - 1:
+            mask = (p >= edges[i]) & (p <= edges[i + 1])
+        else:
+            mask = (p >= edges[i]) & (p < edges[i + 1])
+        if mask.any():
+            ece += mask.mean() * abs(float(y[mask].mean()) - float(p[mask].mean()))
+    return float(ece)
+
+
+def metric_row(y: np.ndarray, p: np.ndarray, pred: np.ndarray) -> dict[str, float]:
+    from sklearn.metrics import (
+        accuracy_score, balanced_accuracy_score, f1_score, matthews_corrcoef,
+        roc_auc_score, average_precision_score, brier_score_loss, log_loss, confusion_matrix,
+    )
+    y = np.asarray(y).astype(int)
+    p = np.asarray(p, dtype=float)
+    pred = np.asarray(pred).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+    return {
+        "accuracy": float(accuracy_score(y, pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+        "sensitivity": float(tp / max(tp + fn, 1)),
+        "specificity": float(tn / max(tn + fp, 1)),
+        "f1": float(f1_score(y, pred, zero_division=0)),
+        "mcc": float(matthews_corrcoef(y, pred)) if len(np.unique(pred)) > 1 else 0.0,
+        "roc_auc": float(roc_auc_score(y, p)) if len(np.unique(y)) == 2 else np.nan,
+        "pr_auc": float(average_precision_score(y, p)) if len(np.unique(y)) == 2 else np.nan,
+        "brier": float(brier_score_loss(y, p)),
+        "log_loss": float(log_loss(y, np.clip(p, 1e-7, 1 - 1e-7), labels=[0, 1])),
+        "ece": ece_score(y, p),
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+    }
+
+
+def checkpoint_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for keys, g in predictions.groupby(["model_key", "model_name", "seed", "outer_fold"], sort=True):
+        m = metric_row(g.label.values, g.prob_calibrated.values, g.pred.values)
+        rows.append({"model_key": keys[0], "model_name": keys[1], "seed": keys[2], "outer_fold": keys[3], **m})
+    return pd.DataFrame(rows)
+
+
+def ensemble_predictions(predictions: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for (model_key, rel), g in predictions.groupby(["model_key", "relative_path"], sort=True):
+        p = float(g.prob_calibrated.mean())
+        raw = float(g.prob_raw.mean())
+        majority = int(g.pred.mean() >= 0.5)
+        rows.append({
+            "model_key": model_key,
+            "model_name": MODEL_NAMES[model_key],
+            "relative_path": rel,
+            "external_group_id": str(g.external_group_id.iloc[0]),
+            "label": int(g.label.iloc[0]),
+            "prob_raw_mean": raw,
+            "prob_calibrated_mean": p,
+            "pred_majority": majority,
+            "n_checkpoints": int(len(g)),
+            "mean_threshold": float(g.threshold.mean()),
+            "decision_margin": float(abs(p - g.threshold.mean())),
+        })
+    return pd.DataFrame(rows)
+
+
+def ensemble_metrics(ens: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for model_key, g in ens.groupby("model_key", sort=True):
+        m = metric_row(g.label.values, g.prob_calibrated_mean.values, g.pred_majority.values)
+        rows.append({"model_key": model_key, "model_name": MODEL_NAMES[model_key], "n": len(g), **m})
+    return pd.DataFrame(rows)
+
+
+def cluster_bootstrap_ci(ens: pd.DataFrame, reps: int = BOOTSTRAP_REPS) -> pd.DataFrame:
+    rng = np.random.default_rng(RNG_SEED)
+    metrics = ["accuracy", "balanced_accuracy", "sensitivity", "specificity", "f1", "mcc", "roc_auc", "pr_auc", "brier", "log_loss", "ece"]
+    out = []
+    for model_key, g in ens.groupby("model_key", sort=True):
+        groups = g.external_group_id.astype(str).unique()
+        group_to_idx = {gr: np.where(g.external_group_id.astype(str).values == gr)[0] for gr in groups}
+        vals = {m: [] for m in metrics}
+        valid = 0
+        for _ in range(reps):
+            sampled = rng.choice(groups, size=len(groups), replace=True)
+            idx = np.concatenate([group_to_idx[gr] for gr in sampled])
+            b = g.iloc[idx]
+            if b.label.nunique() < 2:
+                continue
+            mm = metric_row(b.label.values, b.prob_calibrated_mean.values, b.pred_majority.values)
+            valid += 1
+            for m in metrics:
+                vals[m].append(mm[m])
+        for m in metrics:
+            arr = np.asarray(vals[m], dtype=float)
+            out.append({
+                "model_key": model_key,
+                "model_name": MODEL_NAMES[model_key],
+                "metric": m,
+                "estimate": float(metric_row(g.label.values, g.prob_calibrated_mean.values, g.pred_majority.values)[m]),
+                "ci_low": float(np.nanquantile(arr, 0.025)) if len(arr) else np.nan,
+                "ci_high": float(np.nanquantile(arr, 0.975)) if len(arr) else np.nan,
+                "valid_bootstrap_reps": int(valid),
+                "requested_reps": int(reps),
+                "n_external_groups": int(len(groups)),
+            })
+    return pd.DataFrame(out)
+
+
+def internal_vs_external(fold_metrics: pd.DataFrame, ext_metrics: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    candidates = {
+        "accuracy": ["accuracy", "acc"],
+        "balanced_accuracy": ["balanced_accuracy", "bal_acc", "ba"],
+        "sensitivity": ["sensitivity", "sens"],
+        "specificity": ["specificity", "spec"],
+        "f1": ["f1"],
+        "mcc": ["mcc"],
+        "roc_auc": ["roc_auc", "auc"],
+        "pr_auc": ["pr_auc", "average_precision"],
+        "brier": ["brier"],
+        "log_loss": ["log_loss", "logloss"],
+        "ece": ["ece"],
+    }
+    for _, er in ext_metrics.iterrows():
+        model_key = er.model_key
+        ig = fold_metrics[fold_metrics.model_key == model_key]
+        for metric, names in candidates.items():
+            col = next((c for c in names if c in ig.columns), None)
+            if col is None:
+                continue
+            internal_mean = float(pd.to_numeric(ig[col], errors="coerce").mean())
+            external = float(er[metric])
+            rows.append({
+                "model_key": model_key,
+                "model_name": MODEL_NAMES[model_key],
+                "metric": metric,
+                "internal_macro_mean": internal_mean,
+                "external_ensemble": external,
+                "external_minus_internal": external - internal_mean,
+            })
+    return pd.DataFrame(rows)
+
+
+def selective_referral(ens: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for model_key, g in ens.groupby("model_key", sort=True):
+        g = g.copy().sort_values("decision_margin", ascending=False, kind="stable")
+        total_errors = int((g.label.values != g.pred_majority.values).sum())
+        for coverage in [1.00, 0.95, 0.90, 0.85, 0.80]:
+            keep_n = max(1, int(round(len(g) * coverage)))
+            kept = g.iloc[:keep_n]
+            mm = metric_row(kept.label.values, kept.prob_calibrated_mean.values, kept.pred_majority.values)
+            kept_errors = int((kept.label.values != kept.pred_majority.values).sum())
+            captured = total_errors - kept_errors
+            rows.append({
+                "model_key": model_key,
+                "model_name": MODEL_NAMES[model_key],
+                "coverage": coverage,
+                "referral_fraction": 1.0 - coverage,
+                "n_kept": keep_n,
+                "accuracy": mm["accuracy"],
+                "sensitivity": mm["sensitivity"],
+                "specificity": mm["specificity"],
+                "errors_remaining": kept_errors,
+                "errors_captured": captured,
+                "error_capture_fraction": float(captured / total_errors) if total_errors else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
