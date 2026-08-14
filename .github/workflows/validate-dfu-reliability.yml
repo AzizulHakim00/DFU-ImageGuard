@@ -1,0 +1,63 @@
+name: Validate DFU reliability framework
+
+on:
+  push:
+    branches: [reliability-framework-v1]
+  pull_request:
+    paths:
+      - "src/reliability_*"
+      - "tests/test_reliability_*"
+      - "tests/test_external_manifest.py"
+      - "tests/test_no_test_tuning.py"
+      - "notebooks/DFU_Reliability_*"
+      - "docs/DFU_RELIABILITY_*"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pytest torch torchvision timm numpy pandas scipy scikit-learn Pillow matplotlib
+      - name: Compile reliability source
+        run: |
+          python -m py_compile \
+            src/reliability_models.py \
+            src/reliability_metrics.py \
+            src/reliability_io.py \
+            src/reliability_training.py \
+            src/reliability_robustness.py \
+            src/reliability_reporting_core.py \
+            src/reliability_xai.py \
+            src/reliability_runner.py \
+            src/reliability_external.py \
+            src/reliability_launcher.py \
+            src/reliability_sync.py
+      - name: Run reliability tests
+        run: |
+          pytest -q \
+            tests/test_reliability_metrics.py \
+            tests/test_reliability_protocol.py \
+            tests/test_reliability_models.py \
+            tests/test_reliability_sync.py \
+            tests/test_external_manifest.py \
+            tests/test_no_test_tuning.py
+      - name: Compile one-cell notebooks
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          for path in Path('notebooks').glob('DFU_Reliability_*OneCell.ipynb'):
+              notebook=json.loads(path.read_text(encoding='utf-8'))
+              code='\n'.join(
+                  ''.join(cell.get('source', []))
+                  for cell in notebook['cells']
+                  if cell.get('cell_type')=='code'
+              )
+              compile(code,str(path),'exec')
+              print('PASS',path)
+          PY
